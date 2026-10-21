@@ -894,6 +894,78 @@ async def ws_purge_device(hass: HomeAssistant, connection: websocket_api.ActiveC
     connection.send_result(msg["id"], {"ok": True, "refresh_required": False, "purged_entities": len(entity_ids), "stats": stats, "progress": progress})
 
 
+@websocket_api.require_admin
+@websocket_api.async_response
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gui_recorder/purge_selected",
+        vol.Required("entity_ids"): vol.All(
+            [vol.All(str, vol.Length(min=3, max=255))],
+            vol.Length(min=1, max=5000),
+        ),
+    }
+)
+async def ws_purge_selected(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Purge a UI-selected set of entities as one tracked recorder job."""
+    if _purge_is_active(hass):
+        connection.send_error(
+            msg["id"], "purge_in_progress", "Another purge is already in progress"
+        )
+        return
+
+    entity_ids = sorted(
+        {
+            normalized
+            for entity_id in msg["entity_ids"]
+            if (normalized := _normalize_entity_id(entity_id))
+        }
+    )
+    if not entity_ids:
+        connection.send_error(msg["id"], "empty_selection", "No entities selected")
+        return
+
+    try:
+        progress = await _purge_entities_and_wait(
+            hass,
+            entity_ids,
+            kind="selected",
+            label=f"{len(entity_ids)} selected entities",
+        )
+        _set_purge_progress(hass, active=True, status="analyzing")
+        stats = await async_analyze_db(hass)
+        progress = _set_purge_progress(hass, active=False, status="completed")
+    except asyncio.CancelledError:
+        _set_purge_progress(
+            hass,
+            active=False,
+            status="error",
+            error=(
+                "Purge monitoring was interrupted; the queued HA purge may continue "
+                "in the background."
+            ),
+        )
+        raise
+    except Exception as err:  # noqa: BLE001
+        _set_purge_progress(hass, active=False, status="error", error=str(err))
+        connection.send_error(msg["id"], "purge_failed", str(err))
+        return
+
+    connection.send_result(
+        msg["id"],
+        {
+            "ok": True,
+            "refresh_required": False,
+            "purged_entities": len(entity_ids),
+            "stats": stats,
+            "progress": progress,
+        },
+    )
+
+
 
 
 @websocket_api.require_admin
@@ -994,6 +1066,7 @@ async def async_setup_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_purge_excluded_entities)
     websocket_api.async_register_command(hass, ws_purge_entity)
     websocket_api.async_register_command(hass, ws_purge_device)
+    websocket_api.async_register_command(hass, ws_purge_selected)
     websocket_api.async_register_command(hass, ws_restart_homeassistant)
     websocket_api.async_register_command(hass, ws_get_migration_status)
     websocket_api.async_register_command(hass, ws_import_legacy)

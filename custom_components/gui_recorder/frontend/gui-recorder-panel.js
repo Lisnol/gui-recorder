@@ -25,6 +25,9 @@ class GuiRecorderPanel extends HTMLElement {
     this._analyzing = false;
     this._purgingAll = false;
     this._purgingExcluded = false;
+    this._bulkMode = false;
+    this._bulkSelected = new Set();
+    this._bulkPurging = false;
     this._purgeProgress = null;
     this._purgeProgressTimer = null;
     this._savingGlobal = false;
@@ -89,6 +92,7 @@ class GuiRecorderPanel extends HTMLElement {
       this._autoUpdateDataValue = Boolean(result?.auto_update_data ?? true);
       this._repackAfterManualPurgeValue = Boolean(result?.repack_after_manual_purge ?? false);
       this._manualExclusionsValue = result?.manual_exclusions_yaml || "";
+      this._pruneBulkSelection();
       try {
         this._migration = await this._hass.connection.sendMessagePromise({ type: "gui_recorder/get_migration_status" });
       } catch (_err) {}
@@ -118,6 +122,7 @@ class GuiRecorderPanel extends HTMLElement {
     this._autoUpdateDataValue = Boolean(result?.auto_update_data ?? this._autoUpdateDataValue ?? true);
     this._repackAfterManualPurgeValue = Boolean(result?.repack_after_manual_purge ?? this._repackAfterManualPurgeValue ?? false);
     this._manualExclusionsValue = result?.manual_exclusions_yaml ?? this._manualExclusionsValue ?? "";
+    this._pruneBulkSelection();
   }
 
   _formatNumber(value) {
@@ -170,7 +175,7 @@ class GuiRecorderPanel extends HTMLElement {
   }
 
   _isPurgeBusy() {
-    if (this._purgingAll || this._purgingExcluded || this._data?.repack_in_progress || this._purgeProgress?.active) return true;
+    if (this._purgingAll || this._purgingExcluded || this._bulkPurging || this._data?.repack_in_progress || this._purgeProgress?.active) return true;
     for (const key of this._pending) {
       if (String(key).startsWith("purge:")) return true;
       if (String(key).startsWith("purge-device:")) return true;
@@ -252,6 +257,83 @@ class GuiRecorderPanel extends HTMLElement {
     if (active === 0) return { mode: "off", all: false, some: false, label: "OFF" };
     if (active === total) return { mode: "on", all: true, some: false, label: "ON" };
     return { mode: "mixed", all: false, some: true, label: `${active}/${total}` };
+  }
+
+  _allPurgeEntities() {
+    const entities = new Map();
+    for (const device of this._data.devices || []) {
+      for (const entity of device.entities || []) entities.set(entity.entity_id, entity);
+    }
+    for (const entity of this._data.orphans || []) entities.set(entity.entity_id, entity);
+    for (const entity of this._data.obsolete || []) entities.set(entity.entity_id, entity);
+    return entities;
+  }
+
+  _pruneBulkSelection() {
+    if (!this._bulkSelected) this._bulkSelected = new Set();
+    const available = this._allPurgeEntities();
+    this._bulkSelected = new Set(
+      [...this._bulkSelected].filter((entityId) => Number(available.get(entityId)?.record_count || 0) > 0),
+    );
+  }
+
+  _bulkSelectionSummary() {
+    const available = this._allPurgeEntities();
+    let records = 0;
+    const entityIds = [];
+    for (const entityId of this._bulkSelected) {
+      const entity = available.get(entityId);
+      if (!entity || Number(entity.record_count || 0) <= 0) continue;
+      entityIds.push(entityId);
+      records += Number(entity.record_count || 0);
+    }
+    return { entityIds: entityIds.sort(), records };
+  }
+
+  _bulkDeviceState(device) {
+    const entities = (device.entities || []).filter((entity) => Number(entity.record_count || 0) > 0);
+    const selected = entities.filter((entity) => this._bulkSelected.has(entity.entity_id)).length;
+    return {
+      checked: entities.length > 0 && selected === entities.length,
+      indeterminate: selected > 0 && selected < entities.length,
+      disabled: entities.length === 0,
+    };
+  }
+
+  _setBulkMode(enabled) {
+    this._bulkMode = Boolean(enabled);
+    if (!this._bulkMode) this._bulkSelected.clear();
+    this._render();
+  }
+
+  _setBulkEntity(entityId, selected) {
+    if (selected) this._bulkSelected.add(entityId);
+    else this._bulkSelected.delete(entityId);
+    this._render();
+  }
+
+  _setBulkDevice(deviceId, selected) {
+    const device = (this._data.devices || []).find((item) => item.device_id === deviceId);
+    if (!device) return;
+    for (const entity of device.entities || []) {
+      if (Number(entity.record_count || 0) <= 0) continue;
+      if (selected) this._bulkSelected.add(entity.entity_id);
+      else this._bulkSelected.delete(entity.entity_id);
+    }
+    this._render();
+  }
+
+  _selectBulkVisible(entityIds) {
+    const available = this._allPurgeEntities();
+    for (const entityId of entityIds) {
+      if (Number(available.get(entityId)?.record_count || 0) > 0) this._bulkSelected.add(entityId);
+    }
+    this._render();
+  }
+
+  _clearBulkSelection() {
+    this._bulkSelected.clear();
+    this._render();
   }
 
   _toggleExpanded(deviceId) {
@@ -571,6 +653,49 @@ class GuiRecorderPanel extends HTMLElement {
     }
   }
 
+  async _purgeSelected() {
+    if (this._isPurgeBusy()) return;
+    const { entityIds, records } = this._bulkSelectionSummary();
+    if (!entityIds.length) return;
+    const entityWord = entityIds.length === 1 ? "entity" : "entities";
+    if (!confirm(`This will permanently delete the full stored history for ${entityIds.length} selected ${entityWord} (currently ${this._formatNumber(records)} analyzed records). This cannot be undone. Continue?`)) return;
+
+    this._bulkPurging = true;
+    this._message = `Purging ${entityIds.length} selected ${entityWord}…`;
+    this._render();
+    let statsRefreshed = false;
+    let purgeFailed = false;
+    try {
+      const request = this._hass.connection.sendMessagePromise({
+        type: "gui_recorder/purge_selected",
+        entity_ids: entityIds,
+      });
+      this._startPurgeProgressPolling();
+      const result = await request;
+      this._purgeProgress = result?.progress || this._purgeProgress;
+      statsRefreshed = Boolean(result?.stats);
+      this._bulkSelected.clear();
+      this._message = `Purge completed for ${result?.purged_entities || entityIds.length} selected ${entityWord} (${this._formatNumber(result?.progress?.deleted_rows || 0)} records deleted). Data updated.`;
+    } catch (err) {
+      purgeFailed = true;
+      const detail = err?.message || String(err);
+      this._purgeProgress = { ...(this._purgeProgress || {}), active: false, status: "error", error: detail };
+      this._message = `Error purging selected entities: ${detail}. Do not immediately retry; Home Assistant may still be processing an already queued batch.`;
+      this._render();
+    } finally {
+      this._stopPurgeProgressPolling();
+      this._bulkPurging = false;
+      this._render();
+      if (statsRefreshed) {
+        this._refreshRecommended = false;
+        this._dataMessage = "Data updated.";
+        await this._load();
+      } else if (!purgeFailed && !this._analyzing && this._autoUpdateDataValue) {
+        this._analyzeDb();
+      }
+    }
+  }
+
 
   async _restartHomeAssistant() {
     if (!confirm("Home Assistant will restart now. Continue?")) return;
@@ -775,6 +900,13 @@ class GuiRecorderPanel extends HTMLElement {
     const visibleDeviceEntityIds = filteredDevices.flatMap((d) => this._deviceVisibleEntities(d).map((e) => e.entity_id));
     const visibleOrphanEntityIds = filteredOrphans.map((e) => e.entity_id);
     const filteredObsolete = (this._data.obsolete || []).filter((e) => this._entityMatches(e));
+    const purgeEntities = this._allPurgeEntities();
+    const visiblePurgeEntityIds = [...new Set([
+      ...visibleDeviceEntityIds,
+      ...visibleOrphanEntityIds,
+      ...filteredObsolete.map((e) => e.entity_id),
+    ])].filter((entityId) => Number(purgeEntities.get(entityId)?.record_count || 0) > 0);
+    const bulkSummary = this._bulkSelectionSummary();
     const filteredUnmatchedExclusions = (this._data.unmatched_exclusions || []).filter((e) => !this._filter || String(e).toLowerCase().includes(this._filter.toLowerCase()));
     const stats = this._data.stats || {};
     const totalRows = Number(stats.total_rows || 0);
@@ -822,6 +954,7 @@ class GuiRecorderPanel extends HTMLElement {
         .device-block { border-top:1px solid var(--divider-color); }
         .device-block:first-of-type { border-top:none; }
         .device-head { display:grid; grid-template-columns:auto 1fr auto auto auto auto; gap:12px; align-items:center; padding:14px 6px; }
+        .device-head.bulk { grid-template-columns:auto auto 1fr auto auto auto auto; }
         .caret { width:28px; height:28px; display:inline-flex; align-items:center; justify-content:center; border:none; background:transparent; color:var(--secondary-text-color); cursor:pointer; border-radius:8px; }
         .caret:hover { background:var(--secondary-background-color); }
         .caret-icon { display:inline-block; transition:transform 0.2s ease; font-size:18px; line-height:1; }
@@ -858,6 +991,11 @@ class GuiRecorderPanel extends HTMLElement {
         }
         .right { text-align:right; white-space:nowrap; }
         .actions-cell { display:flex; align-items:center; gap:10px; justify-content:flex-start; flex-wrap:wrap; }
+        .bulk-bar { position:sticky; top:8px; z-index:19; border-color:var(--primary-color); display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+        .bulk-summary { display:flex; flex-direction:column; gap:3px; }
+        .bulk-checkbox { width:18px; height:18px; accent-color:var(--primary-color); cursor:pointer; }
+        .bulk-checkbox[disabled] { cursor:default; opacity:0.5; }
+        .bulk-col { width:34px; text-align:center; }
       </style>
       <div class="wrap">
         ${this._data.pending_restart ? `<div class="notice pending sticky"><strong>Pending changes.</strong> Restart Home Assistant so Recorder can apply the new configuration.</div>` : ""}
@@ -974,6 +1112,13 @@ class GuiRecorderPanel extends HTMLElement {
               </div>
             </div>
             <div class="setting-box">
+              <div class="stat-label">Bulk purge</div>
+              <div class="row-note">Select any combination of devices, entities without a device, or obsolete entities, then purge them as one tracked job.</div>
+              <div class="setting-actions" style="margin-top:12px;">
+                <button class="action-button" id="bulk-mode-toggle" ${purgeActionBusy ? "disabled" : ""}>${this._bulkMode ? "Close bulk selection" : "Select entities to purge"}</button>
+              </div>
+            </div>
+            <div class="setting-box">
               <div class="stat-label">Auto-update data after purge</div>
               <div>${this._switchMarkup({ checked: this._autoUpdateDataValue, kind: "auto-update", entityId: "auto_update_data", disabled: this._togglingAutoUpdate })}${this._togglingAutoUpdate ? `<span class="pending-dot" title="Saving"></span>` : ""}</div>
               <div class="row-note" style="margin-top:8px;">When enabled, database analysis is refreshed automatically after each purge. When disabled, refresh manually from the Data card.</div>
@@ -999,12 +1144,28 @@ class GuiRecorderPanel extends HTMLElement {
           <input id="filter" type="search" placeholder="Filter by entity_id, name, domain, or platform" value="${this._escapeHtml(this._filter)}">
         </div>
 
+        ${this._bulkMode ? `
+        <div class="notice bulk-bar">
+          <div class="bulk-summary">
+            <strong>Bulk selection</strong>
+            <span>${this._formatNumber(bulkSummary.entityIds.length)} entities · ${this._formatNumber(bulkSummary.records)} analyzed records</span>
+            <span class="row-note">Select all visible follows the current filter. The selection is temporary and does not change Recorder settings.</span>
+          </div>
+          <div class="actions-cell">
+            <button class="mini-button" id="bulk-select-visible" ${!visiblePurgeEntityIds.length || purgeActionBusy ? "disabled" : ""}>Select all visible</button>
+            <button class="mini-button" id="bulk-select-none" ${!bulkSummary.entityIds.length || purgeActionBusy ? "disabled" : ""}>Select none</button>
+            <button class="action-button danger" id="bulk-purge-selected" ${!bulkSummary.entityIds.length || purgeActionBusy ? "disabled" : ""}>${this._bulkPurging ? "Purging…" : "Purge selected"}</button>
+            <button class="mini-button" id="bulk-close" ${this._bulkPurging ? "disabled" : ""}>Close</button>
+          </div>
+        </div>
+        ` : ""}
+
         <div class="card">
           <div class="orphans-head">
             <h2>Devices</h2>
             <div class="actions-cell">
-              <button class="mini-button" id="devices-select-all" ${!visibleDeviceEntityIds.length || this._pending.has("bulk:devices:select") ? "disabled" : ""}>Select all</button>
-              <button class="mini-button" id="devices-deselect-all" ${!visibleDeviceEntityIds.length || this._pending.has("bulk:devices:deselect") ? "disabled" : ""}>Deselect all</button>
+              <button class="mini-button" id="devices-select-all" ${!visibleDeviceEntityIds.length || this._pending.has("bulk:devices:select") ? "disabled" : ""}>Record all</button>
+              <button class="mini-button" id="devices-deselect-all" ${!visibleDeviceEntityIds.length || this._pending.has("bulk:devices:deselect") ? "disabled" : ""}>Exclude all</button>
             </div>
           </div>
           ${filteredDevices.length === 0 ? `<div>No devices to display.</div>` : filteredDevices.map((device) => {
@@ -1013,10 +1174,12 @@ class GuiRecorderPanel extends HTMLElement {
             const entities = this._deviceVisibleEntities(device);
             const deviceBusy = this._pending.has(`device:${device.device_id}`);
             const devicePurgeBusy = this._pending.has(`purge-device:${device.device_id}`);
+            const bulkState = this._bulkDeviceState(device);
             return `
               <div class="device-block" data-device-block="${this._escapeHtml(device.device_id)}">
-                <div class="device-head">
+                <div class="device-head ${this._bulkMode ? "bulk" : ""}">
                   <button class="caret" data-toggle-device="${this._escapeHtml(device.device_id)}" aria-label="Expand or collapse device"><span class="caret-icon ${expanded ? "expanded" : ""}">›</span></button>
+                  ${this._bulkMode ? `<input class="bulk-checkbox" type="checkbox" data-bulk-device="${this._escapeHtml(device.device_id)}" aria-label="Select ${this._escapeHtml(device.name)} for purge" ${bulkState.checked ? "checked" : ""} ${bulkState.disabled || purgeActionBusy ? "disabled" : ""}>` : ""}
                   <div>
                     <div class="device-name">${this._escapeHtml(device.name)}</div>
                     <div class="device-meta">${this._escapeHtml([device.manufacturer || "", device.model || ""].filter(Boolean).join(" · "))}</div>
@@ -1031,6 +1194,7 @@ class GuiRecorderPanel extends HTMLElement {
                     <table>
                       <thead>
                         <tr>
+                          ${this._bulkMode ? `<th class="bulk-col">Select</th>` : ""}
                           <th>Entity</th>
                           <th>Name</th>
                           <th>Platform</th>
@@ -1046,6 +1210,7 @@ class GuiRecorderPanel extends HTMLElement {
                           const purgeBusy = this._pending.has(`purge:${entity.entity_id}`);
                           return `
                             <tr>
+                              ${this._bulkMode ? `<td class="bulk-col"><input class="bulk-checkbox" type="checkbox" data-bulk-entity="${this._escapeHtml(entity.entity_id)}" aria-label="Select ${this._escapeHtml(entity.entity_id)} for purge" ${this._bulkSelected.has(entity.entity_id) ? "checked" : ""} ${purgeActionBusy || !entity.record_count ? "disabled" : ""}></td>` : ""}
                               <td><code>${this._escapeHtml(entity.entity_id)}</code></td>
                               <td><div>${this._escapeHtml(entity.name || "")}</div>${entity.disabled_by || entity.hidden_by ? `<div class="row-note">${this._escapeHtml([entity.disabled_by ? `disabled:${entity.disabled_by}` : "", entity.hidden_by ? `hidden:${entity.hidden_by}` : ""].filter(Boolean).join(" · "))}</div>` : ""}</td>
                               <td>${this._escapeHtml(entity.platform || "")}</td>
@@ -1070,14 +1235,15 @@ class GuiRecorderPanel extends HTMLElement {
             <h2>Entities without a device</h2>
             <div class="actions-cell">
               <div class="subtle">${filteredOrphans.length}</div>
-              <button class="mini-button" id="orphans-select-all" ${!visibleOrphanEntityIds.length || this._pending.has("bulk:orphans:select") ? "disabled" : ""}>Select all</button>
-              <button class="mini-button" id="orphans-deselect-all" ${!visibleOrphanEntityIds.length || this._pending.has("bulk:orphans:deselect") ? "disabled" : ""}>Deselect all</button>
+              <button class="mini-button" id="orphans-select-all" ${!visibleOrphanEntityIds.length || this._pending.has("bulk:orphans:select") ? "disabled" : ""}>Record all</button>
+              <button class="mini-button" id="orphans-deselect-all" ${!visibleOrphanEntityIds.length || this._pending.has("bulk:orphans:deselect") ? "disabled" : ""}>Exclude all</button>
             </div>
           </div>
           ${filteredOrphans.length === 0 ? `<div>No unassigned entities.</div>` : `
             <table>
               <thead>
                 <tr>
+                  ${this._bulkMode ? `<th class="bulk-col">Select</th>` : ""}
                   <th>Entity</th>
                   <th>Name</th>
                   <th>Platform</th>
@@ -1093,6 +1259,7 @@ class GuiRecorderPanel extends HTMLElement {
                   const purgeBusy = this._pending.has(`purge:${entity.entity_id}`);
                   return `
                     <tr>
+                      ${this._bulkMode ? `<td class="bulk-col"><input class="bulk-checkbox" type="checkbox" data-bulk-entity="${this._escapeHtml(entity.entity_id)}" aria-label="Select ${this._escapeHtml(entity.entity_id)} for purge" ${this._bulkSelected.has(entity.entity_id) ? "checked" : ""} ${purgeActionBusy || !entity.record_count ? "disabled" : ""}></td>` : ""}
                       <td><code>${this._escapeHtml(entity.entity_id)}</code></td>
                       <td>${this._escapeHtml(entity.name || "")}</td>
                       <td>${this._escapeHtml(entity.platform || "")}</td>
@@ -1146,6 +1313,7 @@ class GuiRecorderPanel extends HTMLElement {
             <table>
               <thead>
                 <tr>
+                  ${this._bulkMode ? `<th class="bulk-col">Select</th>` : ""}
                   <th>Entity</th>
                   <th>Platform</th>
                   <th class="right">Records</th>
@@ -1160,6 +1328,7 @@ class GuiRecorderPanel extends HTMLElement {
                   const purgeBusy = this._pending.has(`purge:${entity.entity_id}`);
                   return `
                     <tr>
+                      ${this._bulkMode ? `<td class="bulk-col"><input class="bulk-checkbox" type="checkbox" data-bulk-entity="${this._escapeHtml(entity.entity_id)}" aria-label="Select ${this._escapeHtml(entity.entity_id)} for purge" ${this._bulkSelected.has(entity.entity_id) ? "checked" : ""} ${purgeActionBusy || !entity.record_count ? "disabled" : ""}></td>` : ""}
                       <td><code>${this._escapeHtml(entity.entity_id)}</code></td>
                       <td>${this._escapeHtml(entity.platform || "")}</td>
                       <td class="right">${this._formatNumber(entity.record_count || 0)}</td>
@@ -1197,6 +1366,11 @@ class GuiRecorderPanel extends HTMLElement {
     this.shadowRoot.getElementById("analyze-db")?.addEventListener("click", () => this._analyzeDb());
     this.shadowRoot.getElementById("purge-all")?.addEventListener("click", () => this._purgeAll());
     this.shadowRoot.getElementById("purge-excluded")?.addEventListener("click", () => this._purgeExcludedEntities());
+    this.shadowRoot.getElementById("bulk-mode-toggle")?.addEventListener("click", () => this._setBulkMode(!this._bulkMode));
+    this.shadowRoot.getElementById("bulk-select-visible")?.addEventListener("click", () => this._selectBulkVisible(visiblePurgeEntityIds));
+    this.shadowRoot.getElementById("bulk-select-none")?.addEventListener("click", () => this._clearBulkSelection());
+    this.shadowRoot.getElementById("bulk-purge-selected")?.addEventListener("click", () => this._purgeSelected());
+    this.shadowRoot.getElementById("bulk-close")?.addEventListener("click", () => this._setBulkMode(false));
     this.shadowRoot.getElementById("restart-ha")?.addEventListener("click", () => this._restartHomeAssistant());
     this.shadowRoot.getElementById("remove-unmatched-exclusions")?.addEventListener("click", () => this._removeUnmatchedExclusions());
     this.shadowRoot.querySelectorAll("[data-remove-exclusion]").forEach((button) => button.addEventListener("click", () => this._removeExclusion(button.getAttribute("data-remove-exclusion"))));
@@ -1210,6 +1384,21 @@ class GuiRecorderPanel extends HTMLElement {
     this.shadowRoot.getElementById("devices-deselect-all")?.addEventListener("click", () => this._setEntitiesBulk(visibleDeviceEntityIds, false, "bulk:devices:deselect"));
     this.shadowRoot.getElementById("orphans-select-all")?.addEventListener("click", () => this._setEntitiesBulk(visibleOrphanEntityIds, true, "bulk:orphans:select"));
     this.shadowRoot.getElementById("orphans-deselect-all")?.addEventListener("click", () => this._setEntitiesBulk(visibleOrphanEntityIds, false, "bulk:orphans:deselect"));
+
+    this.shadowRoot.querySelectorAll("input[data-bulk-entity]").forEach((el) => {
+      el.addEventListener("change", (ev) => {
+        this._setBulkEntity(ev.currentTarget.getAttribute("data-bulk-entity"), ev.currentTarget.checked);
+      });
+    });
+
+    this.shadowRoot.querySelectorAll("input[data-bulk-device]").forEach((el) => {
+      const deviceId = el.getAttribute("data-bulk-device");
+      const device = (this._data.devices || []).find((item) => item.device_id === deviceId);
+      if (device) el.indeterminate = this._bulkDeviceState(device).indeterminate;
+      el.addEventListener("change", (ev) => {
+        this._setBulkDevice(ev.currentTarget.getAttribute("data-bulk-device"), ev.currentTarget.checked);
+      });
+    });
 
     this.shadowRoot.querySelectorAll("[data-toggle-device]").forEach((el) => {
       el.addEventListener("click", (ev) => {

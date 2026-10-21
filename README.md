@@ -20,6 +20,7 @@ A Home Assistant custom component that adds a sidebar panel to manage your `reco
 - **Maintenance actions**:
   - Purge the database (uses global retention setting).
   - Purge excluded entities (full history, ignores retention).
+  - Select devices and entities across the filtered views and purge them together as one tracked job.
   - Auto-update stats after each purge (optional).
   - Repack after manual purge (optional).
   - Restart Home Assistant.
@@ -63,7 +64,7 @@ After installing and configuring the integration, a **GUI Recorder** panel appea
 
 - Filter entities by `entity_id`, friendly name, domain, or platform.
 - Toggle recording for entire devices or individual entities.
-- Run database analysis and purges (global, per-device, or per-entity).
+- Run database analysis and purges (global, per-device, per-entity, or a temporary multi-selection).
 - Import your existing `recorder` config from `configuration.yaml`.
 
 The generated configuration is written to `gui_recorder.yaml`, included from `configuration.yaml` via:
