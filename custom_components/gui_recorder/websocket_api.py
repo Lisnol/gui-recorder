@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import fnmatch
 import logging
 import re
@@ -13,13 +14,16 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN, INTEGRATION_VERSION
-from .db_stats import async_analyze_db
+from .db_stats import async_analyze_db, async_count_entity_rows_before
 from .migration import async_detect_sync_status, async_disable_legacy, async_ensure_gui_enabled, async_import_legacy
 from .storage import async_reload_data, async_save_data
 from .yaml_writer import async_write_yaml, parse_manual_exclusions
 
 _LOGGER = logging.getLogger(__name__)
 _BLOCK_API_WARNED = False
+_PURGE_POLL_INTERVAL = 0.5
+_PURGE_TIMEOUT_SECONDS = 2 * 60 * 60
+_PURGE_STALL_TIMEOUT_SECONDS = 10 * 60
 
 
 def _normalize_entity_id(value: str) -> str:
@@ -52,6 +56,161 @@ async def _wait_recorder_idle(hass: HomeAssistant) -> None:
             _BLOCK_API_WARNED = True
     # Small safety margin for transaction visibility on a fresh read-only session.
     await asyncio.sleep(0.3)
+
+
+def _purge_progress(hass: HomeAssistant) -> dict:
+    """Return the current in-memory purge progress snapshot."""
+    return dict(
+        hass.data.setdefault(DOMAIN, {}).get(
+            "purge_progress",
+            {
+                "active": False,
+                "status": "idle",
+                "kind": None,
+                "label": None,
+                "total_rows": 0,
+                "remaining_rows": 0,
+                "deleted_rows": 0,
+                "percent": 0.0,
+                "error": None,
+            },
+        )
+    )
+
+
+def _set_purge_progress(hass: HomeAssistant, **updates) -> dict:
+    """Update and return purge progress without persisting transient state."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    progress = domain_data.setdefault("purge_progress", _purge_progress(hass))
+    progress.update(updates)
+    progress["updated_at"] = datetime.now(timezone.utc).isoformat()
+    total = max(0, int(progress.get("total_rows", 0)))
+    remaining = max(0, int(progress.get("remaining_rows", 0)))
+    if remaining > total:
+        total = remaining
+        progress["total_rows"] = total
+    deleted = max(0, total - remaining)
+    progress["deleted_rows"] = deleted
+    progress["percent"] = round((deleted / total) * 100, 1) if total else 100.0
+    return dict(progress)
+
+
+def _purge_is_active(hass: HomeAssistant) -> bool:
+    return bool(_purge_progress(hass).get("active"))
+
+
+async def _purge_entities_and_wait(
+    hass: HomeAssistant,
+    entity_ids: list[str],
+    *,
+    kind: str,
+    label: str,
+) -> dict:
+    """Queue one HA entity purge and wait until all of its batches finish."""
+    normalized = sorted({entity_id for entity_id in entity_ids if entity_id})
+    if _purge_is_active(hass):
+        raise RuntimeError("Another purge is already in progress")
+
+    cutoff = datetime.now(timezone.utc)
+    _set_purge_progress(
+        hass,
+        active=True,
+        status="counting",
+        kind=kind,
+        label=label,
+        entity_count=len(normalized),
+        total_rows=0,
+        remaining_rows=0,
+        deleted_rows=0,
+        percent=0.0,
+        error=None,
+        started_at=cutoff.isoformat(),
+    )
+
+    try:
+        initial_rows = await async_count_entity_rows_before(
+            hass, normalized, cutoff.timestamp()
+        )
+        _set_purge_progress(
+            hass,
+            status="purging",
+            total_rows=initial_rows,
+            remaining_rows=initial_rows,
+        )
+        if not normalized or initial_rows == 0:
+            return _set_purge_progress(
+                hass, active=False, status="completed", remaining_rows=0
+            )
+
+        # The service only enqueues Home Assistant's first bounded batch. HA's
+        # PurgeEntitiesTask requeues itself until complete, so it must only be
+        # called once here.
+        await hass.services.async_call(
+            "recorder",
+            "purge_entities",
+            {"entity_id": normalized, "keep_days": 0},
+            blocking=True,
+        )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _PURGE_TIMEOUT_SECONDS
+        last_progress_at = loop.time()
+        last_remaining = initial_rows
+        while True:
+            # A recorder synchronization marker can be overtaken by a purge
+            # batch requeued behind it. Rechecking the target rows is what
+            # proves that every batch belonging to this request is complete.
+            await _wait_recorder_idle(hass)
+            remaining = await async_count_entity_rows_before(
+                hass, normalized, cutoff.timestamp()
+            )
+            _set_purge_progress(
+                hass, status="purging", remaining_rows=remaining
+            )
+            if remaining == 0:
+                # Our cutoff is captured immediately before HA creates its own
+                # purge cutoff. Process one more queue barrier so the final
+                # requeued HA batch (covering that tiny interval) can finish
+                # before the UI reports completion.
+                _set_purge_progress(hass, status="verifying", remaining_rows=0)
+                await _wait_recorder_idle(hass)
+                return _set_purge_progress(
+                    hass, active=False, status="completed", remaining_rows=0
+                )
+            now = loop.time()
+            if remaining < last_remaining:
+                last_remaining = remaining
+                last_progress_at = now
+            if now - last_progress_at >= _PURGE_STALL_TIMEOUT_SECONDS:
+                raise TimeoutError(
+                    "Purge monitoring stopped because the row count did not decrease "
+                    f"for {_PURGE_STALL_TIMEOUT_SECONDS // 60} minutes; "
+                    f"{remaining} pre-existing rows remain. Home Assistant may still "
+                    "continue its queued purge in the background."
+                )
+            if now >= deadline:
+                raise TimeoutError(
+                    f"Purge did not finish within {_PURGE_TIMEOUT_SECONDS // 3600} hours; "
+                    f"{remaining} pre-existing rows remain. Home Assistant may still "
+                    "continue its queued purge in the background."
+                )
+            await asyncio.sleep(_PURGE_POLL_INTERVAL)
+    except asyncio.CancelledError:
+        _set_purge_progress(
+            hass,
+            active=False,
+            status="error",
+            error=(
+                "Purge monitoring was interrupted. Home Assistant may still continue "
+                "its queued purge in the background."
+            ),
+        )
+        raise
+    except Exception as err:
+        _set_purge_progress(
+            hass, active=False, status="error", error=str(err)
+        )
+        raise
 
 
 def _normalize_excluded(values) -> list[str]:
@@ -572,9 +731,21 @@ async def ws_analyze_db(hass: HomeAssistant, connection: websocket_api.ActiveCon
 
 
 @websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): "gui_recorder/get_purge_progress"})
+@callback
+def ws_get_purge_progress(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    connection.send_result(msg["id"], _purge_progress(hass))
+
+
+@websocket_api.require_admin
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/purge_all"})
 async def ws_purge_all(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if _purge_is_active(hass):
+        connection.send_error(msg["id"], "purge_in_progress", "Another purge is already in progress")
+        return
     data = hass.data[DOMAIN]["data"]
     keep_days = int(data.get("purge_keep_days", 10))
     repack = bool(data.get("repack_after_manual_purge", False))
@@ -595,6 +766,9 @@ async def ws_purge_all(hass: HomeAssistant, connection: websocket_api.ActiveConn
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/purge_excluded_entities"})
 async def ws_purge_excluded_entities(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if _purge_is_active(hass):
+        connection.send_error(msg["id"], "purge_in_progress", "Another purge is already in progress")
+        return
     data = hass.data[DOMAIN]["data"]
     entity_ids = sorted(set(data.get("excluded_entities", [])))
     repack = bool(data.get("repack_after_manual_purge", False)) and bool(entity_ids)
@@ -603,56 +777,121 @@ async def ws_purge_excluded_entities(hass: HomeAssistant, connection: websocket_
         await async_save_data(hass, data)
     try:
         if entity_ids:
-            await hass.services.async_call(
-                "recorder",
-                "purge_entities",
-                {"entity_id": entity_ids, "keep_days": 0},
-                blocking=True,
+            progress = await _purge_entities_and_wait(
+                hass,
+                entity_ids,
+                kind="excluded",
+                label=f"{len(entity_ids)} excluded entities",
             )
-            await _wait_recorder_idle(hass)
+        else:
+            progress = _set_purge_progress(
+                hass,
+                active=False,
+                status="completed",
+                kind="excluded",
+                label="Excluded entities",
+                entity_count=0,
+                total_rows=0,
+                remaining_rows=0,
+                error=None,
+            )
         if repack:
+            _set_purge_progress(hass, active=True, status="repacking")
             # purge_entities doesn't support repack; run a no-op purge with very high
             # keep_days to trigger the backend-specific repack operation.
             await hass.services.async_call("recorder", "purge", {"keep_days": 36500, "repack": True}, blocking=True)
             await _wait_recorder_idle(hass)
+        _set_purge_progress(hass, active=True, status="analyzing")
+        stats = await async_analyze_db(hass)
+        progress = _set_purge_progress(hass, active=False, status="completed")
+    except asyncio.CancelledError:
+        _set_purge_progress(
+            hass,
+            active=False,
+            status="error",
+            error="Purge monitoring was interrupted; the queued HA purge may continue in the background.",
+        )
+        raise
+    except Exception as err:  # noqa: BLE001
+        _set_purge_progress(hass, active=False, status="error", error=str(err))
+        connection.send_error(msg["id"], "purge_failed", str(err))
+        return
     finally:
         if data.get("repack_in_progress"):
             data["repack_in_progress"] = False
             await async_save_data(hass, data)
-    connection.send_result(msg["id"], {"ok": True, "refresh_required": True, "purged_entities": len(entity_ids), "repacked": repack})
+    connection.send_result(msg["id"], {"ok": True, "refresh_required": False, "purged_entities": len(entity_ids), "repacked": repack, "progress": progress, "stats": stats})
 
 
 @websocket_api.require_admin
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/purge_entity", vol.Required("entity_id"): str})
 async def ws_purge_entity(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
-    await hass.services.async_call(
-        "recorder",
-        "purge_entities",
-        {"entity_id": [msg["entity_id"]], "keep_days": 0},
-        blocking=True,
-    )
-    await _wait_recorder_idle(hass)
-    stats = await async_analyze_db(hass)
-    connection.send_result(msg["id"], {"ok": True, "refresh_required": True, "stats": stats})
+    if _purge_is_active(hass):
+        connection.send_error(msg["id"], "purge_in_progress", "Another purge is already in progress")
+        return
+    try:
+        progress = await _purge_entities_and_wait(
+            hass,
+            [msg["entity_id"]],
+            kind="entity",
+            label=msg["entity_id"],
+        )
+        _set_purge_progress(hass, active=True, status="analyzing")
+        stats = await async_analyze_db(hass)
+        progress = _set_purge_progress(hass, active=False, status="completed")
+    except asyncio.CancelledError:
+        _set_purge_progress(
+            hass,
+            active=False,
+            status="error",
+            error="Purge monitoring was interrupted; the queued HA purge may continue in the background.",
+        )
+        raise
+    except Exception as err:  # noqa: BLE001
+        _set_purge_progress(hass, active=False, status="error", error=str(err))
+        connection.send_error(msg["id"], "purge_failed", str(err))
+        return
+    connection.send_result(msg["id"], {"ok": True, "refresh_required": False, "stats": stats, "progress": progress})
 
 
 @websocket_api.require_admin
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/purge_device", vol.Required("device_id"): str})
 async def ws_purge_device(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if _purge_is_active(hass):
+        connection.send_error(msg["id"], "purge_in_progress", "Another purge is already in progress")
+        return
     entity_registry = er.async_get(hass)
+    device_registry = dr.async_get(hass)
+    device = device_registry.async_get(msg["device_id"])
+    device_label = msg["device_id"]
+    if device:
+        device_label = device.name_by_user or device.name or device_label
     entity_ids = sorted({entry.entity_id for entry in entity_registry.entities.values() if entry.device_id == msg["device_id"]})
-    if entity_ids:
-        await hass.services.async_call(
-            "recorder",
-            "purge_entities",
-            {"entity_id": entity_ids, "keep_days": 0},
-            blocking=True,
+    try:
+        progress = await _purge_entities_and_wait(
+            hass,
+            entity_ids,
+            kind="device",
+            label=device_label,
         )
-        await _wait_recorder_idle(hass)
-    stats = await async_analyze_db(hass)
-    connection.send_result(msg["id"], {"ok": True, "refresh_required": True, "purged_entities": len(entity_ids), "stats": stats})
+        _set_purge_progress(hass, active=True, status="analyzing")
+        stats = await async_analyze_db(hass)
+        progress = _set_purge_progress(hass, active=False, status="completed")
+    except asyncio.CancelledError:
+        _set_purge_progress(
+            hass,
+            active=False,
+            status="error",
+            error="Purge monitoring was interrupted; the queued HA purge may continue in the background.",
+        )
+        raise
+    except Exception as err:  # noqa: BLE001
+        _set_purge_progress(hass, active=False, status="error", error=str(err))
+        connection.send_error(msg["id"], "purge_failed", str(err))
+        return
+    connection.send_result(msg["id"], {"ok": True, "refresh_required": False, "purged_entities": len(entity_ids), "stats": stats, "progress": progress})
 
 
 
@@ -750,6 +989,7 @@ async def async_setup_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_set_repack_after_manual_purge)
     websocket_api.async_register_command(hass, ws_regenerate_yaml)
     websocket_api.async_register_command(hass, ws_analyze_db)
+    websocket_api.async_register_command(hass, ws_get_purge_progress)
     websocket_api.async_register_command(hass, ws_purge_all)
     websocket_api.async_register_command(hass, ws_purge_excluded_entities)
     websocket_api.async_register_command(hass, ws_purge_entity)

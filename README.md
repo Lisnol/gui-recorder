@@ -26,6 +26,7 @@ A Home Assistant custom component that adds a sidebar panel to manage your `reco
 - **Orphan exclusion detection**: shows entries in `gui_recorder.yaml` that no longer match any entity, with a one-click bulk-remove.
 - **Guided migration**: imports your existing `recorder` configuration from `configuration.yaml` in 3 steps (import → disable old block → activate `!include`).
 - **Cache busting**: the panel JS is served with `?v=VERSION` to prevent stale versions after updates.
+- **Tracked entity purges**: device, entity and excluded-entity purges are queued once, monitored across Home Assistant's internal database batches, and reported complete only after all pre-existing target rows are gone. Monitoring stops after 10 minutes without progress (or two hours total) so a stalled database cannot leave the panel locked forever.
 
 ## Screenshots
 

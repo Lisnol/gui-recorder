@@ -143,6 +143,60 @@ def _analyze_recorder_db(hass: HomeAssistant, backend: str) -> dict:
     }
 
 
+def _count_entity_rows_before(
+    hass: HomeAssistant, entity_ids: tuple[str, ...], before_ts: float
+) -> int:
+    """Count target state rows older than a purge request.
+
+    Home Assistant purges entity history in bounded batches and requeues the
+    task until it is complete.  Counting only rows older than the request
+    timestamp lets GUI Recorder detect completion without being kept alive by
+    new states recorded while the purge is running.
+    """
+    from homeassistant.components.recorder.db_schema import States, StatesMeta
+
+    instance = _get_recorder_instance(hass)
+    if instance is None:
+        raise RuntimeError("Recorder is not ready")
+
+    normalized = tuple(sorted({entity_id for entity_id in entity_ids if entity_id}))
+    if not normalized:
+        return 0
+
+    # Leave one bind variable for before_ts. This also keeps the query valid
+    # for SQLite installations whose bind-variable ceiling is much lower than
+    # MariaDB's.
+    chunk_size = max(1, int(getattr(instance, "max_bind_vars", 999)) - 1)
+    total = 0
+    with instance.get_session() as session:
+        for offset in range(0, len(normalized), chunk_size):
+            entity_chunk = normalized[offset : offset + chunk_size]
+            total += int(
+                session.execute(
+                    select(func.count(States.state_id))
+                    .join(StatesMeta, States.metadata_id == StatesMeta.metadata_id)
+                    .where(
+                        StatesMeta.entity_id.in_(entity_chunk),
+                        States.last_updated_ts < before_ts,
+                    )
+                ).scalar_one()
+                or 0
+            )
+    return total
+
+
+async def async_count_entity_rows_before(
+    hass: HomeAssistant, entity_ids: list[str] | tuple[str, ...], before_ts: float
+) -> int:
+    """Count pre-purge target rows on Home Assistant's DB executor."""
+    instance = _get_recorder_instance(hass)
+    if instance is None:
+        raise RuntimeError("Recorder is not ready")
+    return await instance.async_add_executor_job(
+        _count_entity_rows_before, hass, tuple(entity_ids), before_ts
+    )
+
+
 async def async_analyze_db(hass: HomeAssistant) -> dict:
     data = hass.data[DOMAIN]["data"]
     backend = get_recorder_backend(hass)

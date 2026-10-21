@@ -25,6 +25,8 @@ class GuiRecorderPanel extends HTMLElement {
     this._analyzing = false;
     this._purgingAll = false;
     this._purgingExcluded = false;
+    this._purgeProgress = null;
+    this._purgeProgressTimer = null;
     this._savingGlobal = false;
     this._keepDaysValue = 10;
     this._autoPurgeValue = true;
@@ -70,6 +72,10 @@ class GuiRecorderPanel extends HTMLElement {
     this._panel = panel;
   }
 
+  disconnectedCallback() {
+    this._stopPurgeProgressPolling();
+  }
+
   async _load() {
     try {
       const result = await this._hass.connection.sendMessagePromise({ type: "gui_recorder/get_tree" });
@@ -86,8 +92,12 @@ class GuiRecorderPanel extends HTMLElement {
       try {
         this._migration = await this._hass.connection.sendMessagePromise({ type: "gui_recorder/get_migration_status" });
       } catch (_err) {}
+      try {
+        this._purgeProgress = await this._hass.connection.sendMessagePromise({ type: "gui_recorder/get_purge_progress" });
+        if (this._purgeProgress?.active) this._startPurgeProgressPolling();
+      } catch (_err) {}
       this._render();
-      if (this._isDataStale() && !this._analyzing) {
+      if (this._isDataStale() && !this._analyzing && !this._isPurgeBusy()) {
         this._analyzeDb();
       }
     } catch (err) {
@@ -160,12 +170,55 @@ class GuiRecorderPanel extends HTMLElement {
   }
 
   _isPurgeBusy() {
-    if (this._purgingAll || this._purgingExcluded || this._data?.repack_in_progress) return true;
+    if (this._purgingAll || this._purgingExcluded || this._data?.repack_in_progress || this._purgeProgress?.active) return true;
     for (const key of this._pending) {
       if (String(key).startsWith("purge:")) return true;
       if (String(key).startsWith("purge-device:")) return true;
     }
     return false;
+  }
+
+  _purgeProgressMessage(progress = this._purgeProgress) {
+    if (!progress) return "";
+    const label = progress.label || "selected history";
+    const total = Number(progress.total_rows || 0);
+    const remaining = Number(progress.remaining_rows || 0);
+    const deleted = Number(progress.deleted_rows || 0);
+    if (progress.status === "counting") return `Counting stored history for ${label}…`;
+    if (progress.status === "verifying") return `All tracked records for ${label} are gone. Verifying Home Assistant's final queued batch…`;
+    if (progress.status === "repacking") return `Purge batches completed for ${label}. Repacking the database…`;
+    if (progress.status === "analyzing") return `Purge batches completed for ${label}. Updating database analysis…`;
+    if (progress.status === "error") return `Purge monitoring stopped: ${progress.error || "unknown error"}`;
+    if (progress.active || progress.status === "purging") {
+      return `Purging ${label}: ${this._formatNumber(deleted)} of ${this._formatNumber(total)} pre-existing records deleted (${this._formatNumber(remaining)} remaining).`;
+    }
+    return "";
+  }
+
+  async _pollPurgeProgress() {
+    try {
+      const progress = await this._hass.connection.sendMessagePromise({ type: "gui_recorder/get_purge_progress" });
+      this._purgeProgress = progress;
+      const message = this._purgeProgressMessage(progress);
+      if (message) this._message = message;
+      this._render();
+      if (!progress?.active) this._stopPurgeProgressPolling();
+    } catch (_err) {
+      // A transient polling failure must not start another purge or clear the
+      // busy state. The main purge request reports the authoritative result.
+    }
+  }
+
+  _startPurgeProgressPolling() {
+    if (this._purgeProgressTimer) return;
+    this._pollPurgeProgress();
+    this._purgeProgressTimer = setInterval(() => this._pollPurgeProgress(), 1000);
+  }
+
+  _stopPurgeProgressPolling() {
+    if (!this._purgeProgressTimer) return;
+    clearInterval(this._purgeProgressTimer);
+    this._purgeProgressTimer = null;
   }
 
   _isMigrationPending() {
@@ -405,17 +458,32 @@ class GuiRecorderPanel extends HTMLElement {
     this._purgingExcluded = true;
     this._message = "Purging the full history for excluded entities…";
     this._render();
+    let statsRefreshed = false;
+    let purgeFailed = false;
     try {
-      await this._hass.connection.sendMessagePromise({ type: "gui_recorder/purge_excluded_entities" });
-      this._refreshRecommended = true;
-      this._message = "Excluded entities purged. Refreshing analysis…";
+      const request = this._hass.connection.sendMessagePromise({ type: "gui_recorder/purge_excluded_entities" });
+      this._startPurgeProgressPolling();
+      const result = await request;
+      this._purgeProgress = result?.progress || this._purgeProgress;
+      statsRefreshed = Boolean(result?.stats);
+      this._message = `Excluded entities purged (${this._formatNumber(result?.progress?.deleted_rows || 0)} records deleted). Data updated.`;
     } catch (err) {
-      this._message = `Error purging excluded entities: ${err?.message || err}`;
+      purgeFailed = true;
+      const detail = err?.message || String(err);
+      this._purgeProgress = { ...(this._purgeProgress || {}), active: false, status: "error", error: detail };
+      this._message = `Error purging excluded entities: ${detail}. Do not immediately retry; Home Assistant may still be processing an already queued batch.`;
       this._render();
     } finally {
+      this._stopPurgeProgressPolling();
       this._purgingExcluded = false;
       this._render();
-      if (!this._analyzing && this._autoUpdateDataValue) this._analyzeDb();
+      if (statsRefreshed) {
+        this._refreshRecommended = false;
+        this._dataMessage = "Data updated.";
+        await this._load();
+      } else if (!purgeFailed && !this._analyzing && this._autoUpdateDataValue) {
+        this._analyzeDb();
+      }
     }
   }
 
@@ -428,26 +496,34 @@ class GuiRecorderPanel extends HTMLElement {
     this._message = `Purging history for ${entityId}…`;
     this._render();
     let statsRefreshed = false;
+    let purgeFailed = false;
     try {
-      const result = await this._hass.connection.sendMessagePromise({ type: "gui_recorder/purge_entity", entity_id: entityId });
+      const request = this._hass.connection.sendMessagePromise({ type: "gui_recorder/purge_entity", entity_id: entityId });
+      this._startPurgeProgressPolling();
+      const result = await request;
+      this._purgeProgress = result?.progress || this._purgeProgress;
       if (result?.stats) {
         statsRefreshed = true;
-        this._message = `Purge completed for ${entityId}. Data updated.`;
+        this._message = `Purge completed for ${entityId} (${this._formatNumber(result?.progress?.deleted_rows || 0)} records deleted). Data updated.`;
       } else {
         this._refreshRecommended = true;
         this._message = `Purge completed for ${entityId}. Refreshing analysis…`;
       }
     } catch (err) {
-      this._message = `Error purging ${entityId}: ${err?.message || err}`;
+      purgeFailed = true;
+      const detail = err?.message || String(err);
+      this._purgeProgress = { ...(this._purgeProgress || {}), active: false, status: "error", error: detail };
+      this._message = `Error purging ${entityId}: ${detail}. Do not immediately retry; Home Assistant may still be processing an already queued batch.`;
       this._render();
     } finally {
+      this._stopPurgeProgressPolling();
       this._pending.delete(`purge:${entityId}`);
       this._render();
       if (statsRefreshed) {
         this._refreshRecommended = false;
         this._dataMessage = "Data updated.";
         await this._load();
-      } else if (!this._analyzing && this._autoUpdateDataValue) {
+      } else if (!purgeFailed && !this._analyzing && this._autoUpdateDataValue) {
         this._analyzeDb();
       }
     }
@@ -462,26 +538,34 @@ class GuiRecorderPanel extends HTMLElement {
     this._message = `Purging history for ${deviceName}…`;
     this._render();
     let statsRefreshed = false;
+    let purgeFailed = false;
     try {
-      const result = await this._hass.connection.sendMessagePromise({ type: "gui_recorder/purge_device", device_id: deviceId });
+      const request = this._hass.connection.sendMessagePromise({ type: "gui_recorder/purge_device", device_id: deviceId });
+      this._startPurgeProgressPolling();
+      const result = await request;
+      this._purgeProgress = result?.progress || this._purgeProgress;
       if (result?.stats) {
         statsRefreshed = true;
-        this._message = `Purge completed for ${deviceName} (${result?.purged_entities || 0} entities). Data updated.`;
+        this._message = `Purge completed for ${deviceName} (${result?.purged_entities || 0} entities, ${this._formatNumber(result?.progress?.deleted_rows || 0)} records deleted). Data updated.`;
       } else {
         this._refreshRecommended = true;
         this._message = `Purge completed for ${deviceName} (${result?.purged_entities || 0} entities). Refreshing analysis…`;
       }
     } catch (err) {
-      this._message = `Error purging ${deviceName}: ${err?.message || err}`;
+      purgeFailed = true;
+      const detail = err?.message || String(err);
+      this._purgeProgress = { ...(this._purgeProgress || {}), active: false, status: "error", error: detail };
+      this._message = `Error purging ${deviceName}: ${detail}. Do not immediately retry; Home Assistant may still be processing an already queued batch.`;
       this._render();
     } finally {
+      this._stopPurgeProgressPolling();
       this._pending.delete(`purge-device:${deviceId}`);
       this._render();
       if (statsRefreshed) {
         this._refreshRecommended = false;
         this._dataMessage = "Data updated.";
         await this._load();
-      } else if (!this._analyzing && this._autoUpdateDataValue) {
+      } else if (!purgeFailed && !this._analyzing && this._autoUpdateDataValue) {
         this._analyzeDb();
       }
     }
@@ -695,6 +779,7 @@ class GuiRecorderPanel extends HTMLElement {
     const stats = this._data.stats || {};
     const totalRows = Number(stats.total_rows || 0);
     const purgeActionBusy = this._isPurgeBusy();
+    const purgeProgress = this._purgeProgress;
     const migrationPending = this._isMigrationPending();
 
     this.shadowRoot.innerHTML = `
@@ -706,6 +791,7 @@ class GuiRecorderPanel extends HTMLElement {
         .notice.pending { border-color:var(--warning-color, #ff9800); background:color-mix(in srgb, var(--card-background-color) 82%, var(--warning-color, #ff9800)); }
         .notice.pending.sticky { position:sticky; top:0; z-index:20; box-shadow:0 4px 12px rgba(0,0,0,0.2); }
         .notice.stale { border-color:var(--warning-color, #ff9800); border-left:6px solid var(--warning-color, #ff9800); background:color-mix(in srgb, var(--card-background-color) 76%, var(--warning-color, #ff9800)); color:var(--primary-text-color); }
+        .purge-progress { width:100%; height:10px; margin-top:10px; accent-color:var(--primary-color); }
         .toolbar-head { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
         .toolbar-actions { display:flex; gap:10px; flex-wrap:wrap; }
         h1, h2, h3 { margin:0 0 12px; }
@@ -870,6 +956,7 @@ class GuiRecorderPanel extends HTMLElement {
         ` : `
         <div class="card">
           <h2>Maintenance actions</h2>
+          ${purgeProgress?.active ? `<div class="notice pending"><strong>Purge in progress.</strong> ${this._escapeHtml(this._purgeProgressMessage(purgeProgress))}<progress class="purge-progress" max="100" value="${Number(purgeProgress.percent || 0)}"></progress><div class="row-note">Monitoring stops automatically after 10 minutes without progress or after 2 hours total. Home Assistant may continue an already queued purge in the background.</div></div>` : ""}
           ${this._data.repack_in_progress ? `<div class="notice pending"><strong>Repack in progress.</strong> The database is being compacted; this can take a while on large databases. Other purge actions are temporarily disabled.</div>` : ""}
           <div class="settings-grid">
             <div class="setting-box">
