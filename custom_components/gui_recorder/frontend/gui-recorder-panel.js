@@ -30,6 +30,8 @@ class GuiRecorderPanel extends HTMLElement {
     this._bulkPurging = false;
     this._purgeProgress = null;
     this._purgeProgressTimer = null;
+    this._purgeProgressSeenActive = false;
+    this._purgeProgressStartDeadline = 0;
     this._savingGlobal = false;
     this._keepDaysValue = 10;
     this._autoPurgeValue = true;
@@ -204,10 +206,16 @@ class GuiRecorderPanel extends HTMLElement {
     try {
       const progress = await this._hass.connection.sendMessagePromise({ type: "gui_recorder/get_purge_progress" });
       this._purgeProgress = progress;
+      if (progress?.active) this._purgeProgressSeenActive = true;
       const message = this._purgeProgressMessage(progress);
       if (message) this._message = message;
       this._render();
-      if (!progress?.active) this._stopPurgeProgressPolling();
+      if (
+        !progress?.active
+        && (this._purgeProgressSeenActive || Date.now() >= this._purgeProgressStartDeadline)
+      ) {
+        this._stopPurgeProgressPolling();
+      }
     } catch (_err) {
       // A transient polling failure must not start another purge or clear the
       // busy state. The main purge request reports the authoritative result.
@@ -216,14 +224,17 @@ class GuiRecorderPanel extends HTMLElement {
 
   _startPurgeProgressPolling() {
     if (this._purgeProgressTimer) return;
-    this._pollPurgeProgress();
+    this._purgeProgressSeenActive = Boolean(this._purgeProgress?.active);
+    this._purgeProgressStartDeadline = Date.now() + 15000;
     this._purgeProgressTimer = setInterval(() => this._pollPurgeProgress(), 1000);
+    this._pollPurgeProgress();
   }
 
   _stopPurgeProgressPolling() {
-    if (!this._purgeProgressTimer) return;
-    clearInterval(this._purgeProgressTimer);
+    if (this._purgeProgressTimer) clearInterval(this._purgeProgressTimer);
     this._purgeProgressTimer = null;
+    this._purgeProgressSeenActive = false;
+    this._purgeProgressStartDeadline = 0;
   }
 
   _isMigrationPending() {
