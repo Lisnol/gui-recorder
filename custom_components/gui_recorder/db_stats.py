@@ -84,18 +84,33 @@ def _sqlite_total_size_bytes(db_path: Path) -> int:
     return total
 
 
-def _mariadb_size_bytes(session) -> int | None:
-    """Return the current MariaDB/MySQL schema size when permitted."""
+def _mariadb_size_breakdown(session) -> dict[str, int | None]:
+    """Return MariaDB/MySQL data, index and reclaimable allocation estimates."""
     try:
-        value = session.execute(
+        row = session.execute(
             text(
-                "SELECT COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) "
+                "SELECT COALESCE(SUM(DATA_LENGTH), 0), "
+                "COALESCE(SUM(INDEX_LENGTH), 0), COALESCE(SUM(DATA_FREE), 0) "
                 "FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()"
             )
-        ).scalar_one()
-        return int(value or 0)
+        ).one()
+        data_bytes = int(row[0] or 0)
+        index_bytes = int(row[1] or 0)
+        return {
+            "db_size_bytes": data_bytes + index_bytes,
+            "db_data_bytes": data_bytes,
+            "db_index_bytes": index_bytes,
+            # DATA_FREE is an engine-reported allocation estimate, not a promise
+            # that this many filesystem bytes will be reclaimed by a repack.
+            "db_free_bytes": int(row[2] or 0),
+        }
     except Exception:  # noqa: BLE001 - size is optional; entity counts still work
-        return None
+        return {
+            "db_size_bytes": None,
+            "db_data_bytes": None,
+            "db_index_bytes": None,
+            "db_free_bytes": None,
+        }
 
 
 def _analyze_recorder_db(hass: HomeAssistant, backend: str) -> dict:
@@ -114,15 +129,21 @@ def _analyze_recorder_db(hass: HomeAssistant, backend: str) -> dict:
             .order_by(func.count(States.state_id).desc())
         ).all()
 
-        db_size_bytes: int | None = None
+        size_info = {
+            "db_size_bytes": None,
+            "db_data_bytes": None,
+            "db_index_bytes": None,
+            "db_free_bytes": None,
+        }
         if backend == "mariadb":
-            db_size_bytes = _mariadb_size_bytes(session)
+            size_info = _mariadb_size_breakdown(session)
 
     entity_counts = {entity_id: int(count) for entity_id, count in rows if entity_id}
     if backend == "sqlite":
         db_path = _resolve_sqlite_db_path(hass)
         database = str(db_path)
-        db_size_bytes = _sqlite_total_size_bytes(db_path)
+        size_info["db_size_bytes"] = _sqlite_total_size_bytes(db_path)
+        size_info["db_data_bytes"] = size_info["db_size_bytes"]
     else:
         engine = getattr(instance, "engine", None)
         url = getattr(engine, "url", None)
@@ -137,7 +158,7 @@ def _analyze_recorder_db(hass: HomeAssistant, backend: str) -> dict:
         "database": database,
         # Keep db_path for compatibility with stored data from older versions.
         "db_path": database,
-        "db_size_bytes": db_size_bytes,
+        **size_info,
         "total_rows": sum(entity_counts.values()),
         "error": None,
     }
@@ -219,6 +240,9 @@ async def async_analyze_db(hass: HomeAssistant) -> dict:
             "database": database,
             "db_path": database,
             "db_size_bytes": None,
+            "db_data_bytes": None,
+            "db_index_bytes": None,
+            "db_free_bytes": None,
             "total_rows": 0,
             "error": str(err),
         }

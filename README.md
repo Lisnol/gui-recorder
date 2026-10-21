@@ -16,18 +16,22 @@ A Home Assistant custom component that adds a sidebar panel to manage your `reco
 
 - **Sidebar panel** integrated directly into the Home Assistant navigation bar.
 - **Per-device and per-entity control**: enable or disable recording with a toggle — no YAML editing required.
-- **Database statistics**: total / current / obsolete records, matched exclusions, database location and disk/schema size when available.
+- **Database statistics**: total / current / obsolete records, matched exclusions, database location and disk/schema size when available. MariaDB also shows data, index, and free-allocation estimates separately.
 - **Maintenance actions**:
   - Purge the database (uses global retention setting).
   - Purge excluded entities (full history, ignores retention).
   - Select devices and entities across the filtered views and purge them together as one tracked job.
+  - Review a preflight summary with affected entities, analyzed rows, database share, repack, and refresh choices before deletion.
   - Auto-update stats after each purge (optional).
   - Repack after manual purge (optional).
   - Restart Home Assistant.
+- **Background purge jobs**: jobs continue on the Home Assistant server if the panel is closed or reloaded, with a sticky live progress card showing deleted rows, remaining rows, elapsed time, rate, and last progress.
+- **Maintenance history**: keeps the latest 20 completed, failed, or interrupted jobs with duration and size change when available.
+- **Large-installation tools**: quick filters, sorting, section-level select/clear, and pagination at 100 rows per page.
 - **Orphan exclusion detection**: shows entries in `gui_recorder.yaml` that no longer match any entity, with a one-click bulk-remove.
 - **Guided migration**: imports your existing `recorder` configuration from `configuration.yaml` in 3 steps (import → disable old block → activate `!include`).
 - **Cache busting**: the panel JS is served with `?v=VERSION` to prevent stale versions after updates.
-- **Tracked entity purges**: device, entity and excluded-entity purges are queued once, monitored across Home Assistant's internal database batches, and reported complete only after all pre-existing target rows are gone. Monitoring stops after 10 minutes without progress (or two hours total) so a stalled database cannot leave the panel locked forever.
+- **Tracked entity purges**: device, entity, selected, and excluded-entity purges are queued once, monitored across Home Assistant's internal database batches, and reported complete only after all pre-existing target rows are gone. Monitoring stops after 10 minutes without progress (or two hours total) so a stalled database cannot leave the panel locked forever.
 
 ## Screenshots
 
@@ -63,9 +67,12 @@ This MariaDB-enabled fork is installed as a custom HACS repository.
 After installing and configuring the integration, a **GUI Recorder** panel appears in the sidebar. From there you can:
 
 - Filter entities by `entity_id`, friendly name, domain, or platform.
+- Apply quick filters, sort by record count/name/entity/domain, and page through large entity collections.
 - Toggle recording for entire devices or individual entities.
 - Run database analysis and purges (global, per-device, per-entity, or a temporary multi-selection).
 - Import your existing `recorder` config from `configuration.yaml`.
+
+Purge jobs are owned by Home Assistant rather than the browser, so navigating away or reloading the panel does not stop them. Restarting Home Assistant does stop GUI Recorder's in-memory monitor: the job is recorded as **interrupted**, no purge is automatically retried, and you should refresh the database analysis before deciding whether to run it again.
 
 The generated configuration is written to `gui_recorder.yaml`, included from `configuration.yaml` via:
 
@@ -111,8 +118,18 @@ To leave `configuration.yaml` clean (recommended), fold `gui_recorder.yaml` back
 
 - GUI Recorder reuses Home Assistant's existing SQLAlchemy recorder connection; it does not need separate database credentials or a Python database driver.
 - Entity counts use Home Assistant's current recorder schema and run on the recorder database executor.
-- Schema size is read from `information_schema.TABLES`. If the recorder user cannot read that metadata, size is shown as unavailable while the rest of the analysis continues to work.
+- Schema data size, index size, and `DATA_FREE` are read from `information_schema.TABLES`. `DATA_FREE` is an engine allocation estimate, not a guarantee that repack will return the same number of filesystem bytes. If the recorder user cannot read that metadata, sizes are shown as unavailable while the rest of the analysis continues to work.
 - Purge and repack actions are delegated to Home Assistant's `recorder` services.
+
+## Development checks
+
+The validation workflow runs Python compilation and unit tests, JavaScript syntax and frontend tests, JSON validation, HACS validation, and Hassfest. The same local tests can be run with:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+node --check custom_components/gui_recorder/frontend/gui-recorder-panel.js
+node tests/frontend.test.js
+```
 
 ## Support
 

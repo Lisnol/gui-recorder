@@ -5,8 +5,11 @@ A Home Assistant sidebar panel to manage your `recorder` configuration and datab
 ## What it does
 
 - Enable or disable recording per device and per entity with a toggle.
-- Database statistics: total / current / obsolete records, matched exclusions, and database size/location when available.
-- Maintenance actions: purge the database, purge excluded entities (full history), repack, restart HA.
+- Database statistics: total / current / obsolete records, matched exclusions, and database size/location when available, including MariaDB data/index/free-allocation estimates.
+- Background maintenance jobs with preflight summaries, live progress, and the latest 20 results.
+- Purge the database, excluded entities, individual devices/entities, or a temporary multi-selection.
+- Quick filters, sorting, section-level selection, and pagination for large installations.
+- Optional analysis refresh and repack after purge, plus Home Assistant restart.
 - Detects orphan exclusions (entries that no longer match any entity) and removes them in bulk.
 - Guided migration from a legacy `recorder:` block in `configuration.yaml`.
 

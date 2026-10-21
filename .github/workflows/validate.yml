@@ -7,7 +7,35 @@ on:
     - cron: "0 0 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  tests:
+    name: Unit and frontend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Compile Python sources
+        run: python -m compileall -q custom_components/gui_recorder
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+      - name: Check and test panel JavaScript
+        run: |
+          node --check custom_components/gui_recorder/frontend/gui-recorder-panel.js
+          node tests/frontend.test.js
+      - name: Validate JSON files
+        run: |
+          python -m json.tool custom_components/gui_recorder/manifest.json >/dev/null
+          python -m json.tool custom_components/gui_recorder/strings.json >/dev/null
+          python -m json.tool hacs.json >/dev/null
+
   hacs:
     name: HACS validation
     runs-on: ubuntu-latest

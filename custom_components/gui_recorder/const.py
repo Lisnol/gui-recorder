@@ -17,6 +17,8 @@ DEFAULT_STORAGE = {
     "auto_update_data": True,
     "repack_after_manual_purge": False,
     "repack_in_progress": False,
+    "active_purge": None,
+    "purge_history": [],
     "legacy_imported_at": None,
     "stats": {
         "entity_counts": {},
@@ -25,6 +27,9 @@ DEFAULT_STORAGE = {
         "database": "home-assistant_v2.db",
         "db_path": "home-assistant_v2.db",
         "db_size_bytes": None,
+        "db_data_bytes": None,
+        "db_index_bytes": None,
+        "db_free_bytes": None,
         "error": None,
     },
 }
@@ -33,4 +38,4 @@ PANEL_TITLE = "GUI Recorder"
 PANEL_ICON = "mdi:database-cog"
 PANEL_MODULE_URL = "/api/gui_recorder/static/gui-recorder-panel.js"
 
-INTEGRATION_VERSION = "0.9.3"
+INTEGRATION_VERSION = "0.10.0"

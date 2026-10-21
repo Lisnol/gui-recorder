@@ -9,6 +9,7 @@ from .const import DOMAIN
 from .db_stats import is_supported_recorder
 from .migration import async_detect_sync_status
 from .panel import async_setup_panel
+from .purge_jobs import async_restore_interrupted_purge
 from .storage import async_load_data, async_save_data
 from .websocket_api import async_setup_websocket_api
 from .yaml_writer import async_write_yaml
@@ -20,6 +21,8 @@ async def _async_initialize(hass: HomeAssistant) -> None:
     hass.data.setdefault(DOMAIN, {})
 
     data = await async_load_data(hass)
+    await async_restore_interrupted_purge(hass)
+    data = hass.data[DOMAIN]["data"]
     dirty = False
     if data.get("pending_restart"):
         data["pending_restart"] = False
@@ -49,13 +52,14 @@ async def async_setup(hass: HomeAssistant, _config: dict) -> bool:
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, _entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if is_supported_recorder(hass) is False:
         _LOGGER.error(
             "GUI Recorder only supports the SQLite and MariaDB recorder backends. "
             "Detected a different db_url; aborting setup."
         )
         return False
+    hass.data.setdefault(DOMAIN, {})["config_entry"] = entry
     await _async_initialize(hass)
     _LOGGER.info("GUI Recorder initialized")
     return True
