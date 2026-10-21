@@ -6,6 +6,7 @@ DEFAULT_STORAGE = {
     "rescued_entities": [],
     "manual_exclusions_yaml": "",
     "db_url": None,
+    "db_url_secret": None,
     "generated_path": "gui_recorder.yaml",
     "mode": "exclude_entities",
     "pending_restart": False,
@@ -20,8 +21,10 @@ DEFAULT_STORAGE = {
     "stats": {
         "entity_counts": {},
         "generated_at": None,
+        "backend": None,
+        "database": "home-assistant_v2.db",
         "db_path": "home-assistant_v2.db",
-        "db_size_bytes": 0,
+        "db_size_bytes": None,
         "error": None,
     },
 }
@@ -30,4 +33,4 @@ PANEL_TITLE = "GUI Recorder"
 PANEL_ICON = "mdi:database-cog"
 PANEL_MODULE_URL = "/api/gui_recorder/static/gui-recorder-panel.js"
 
-INTEGRATION_VERSION = "0.8.40"
+INTEGRATION_VERSION = "0.9.0"

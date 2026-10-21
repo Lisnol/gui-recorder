@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -75,6 +76,7 @@ async def async_write_yaml(hass: HomeAssistant) -> str:
     auto_repack = bool(data.get("auto_repack", True))
     commit_interval = int(data.get("commit_interval", 5))
     db_url = data.get("db_url")
+    db_url_secret = data.get("db_url_secret")
 
     path = Path(hass.config.path(generated_path))
 
@@ -127,9 +129,12 @@ async def async_write_yaml(hass: HomeAssistant) -> str:
     parts.append(f"auto_repack: {'true' if auto_repack else 'false'}")
     parts.append(f"purge_keep_days: {purge_keep_days}")
     parts.append(f"commit_interval: {commit_interval}")
-    if isinstance(db_url, str) and db_url.strip():
-        # safe_dump quotes the value if the sqlite URL needs it (it usually
-        # doesn't, but the ':' and '///' are safest left to the emitter).
+    if isinstance(db_url_secret, str) and db_url_secret.strip():
+        # Keep only the secret's name in storage. Home Assistant resolves the
+        # actual MariaDB URL when it loads the generated recorder configuration.
+        parts.append(f"db_url: !secret {json.dumps(db_url_secret.strip())}")
+    elif isinstance(db_url, str) and db_url.strip():
+        # Custom SQLite paths are not credentials and can be stored directly.
         parts.append(yaml.safe_dump({"db_url": db_url.strip()}, default_flow_style=False).rstrip())
     parts.append("")
 

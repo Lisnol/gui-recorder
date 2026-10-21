@@ -14,7 +14,7 @@ class GuiRecorderPanel extends HTMLElement {
       auto_repack: true,
       commit_interval: 5,
       auto_update_data: true,
-      stats: { entity_counts: {}, generated_at: null, db_path: "home-assistant_v2.db", total_rows: 0, error: null },
+      stats: { entity_counts: {}, generated_at: null, backend: null, database: "home-assistant_v2.db", db_size_bytes: null, total_rows: 0, error: null },
     };
     this._filter = "";
     this._filterDebounceTimer = null;
@@ -854,8 +854,8 @@ class GuiRecorderPanel extends HTMLElement {
             <div class="stat-box"><div class="stat-label">Current records</div><div class="stat-value">${this._formatNumber(stats.current_rows || 0)}</div></div>
             <div class="stat-box"><div class="stat-label">Obsolete / unlinked records</div><div class="stat-value">${this._formatNumber(stats.obsolete_rows || 0)}</div></div>
             <div class="stat-box"><div class="stat-label">Configured exclusions</div><div class="stat-value">${this._formatNumber(stats.configured_exclusions || 0)}</div><div class="stat-subtle">Matched ${this._formatNumber(stats.matched_exclusions || 0)} · Unmatched ${this._formatNumber(stats.unmatched_exclusions || 0)}</div></div>
-            <div class="stat-box"><div class="stat-label">DB size</div><div class="stat-value">${this._escapeHtml(this._formatBytes(stats.db_size_bytes || 0))}</div></div>
-            <div class="stat-box"><div class="stat-label">Database</div><div class="stat-value">${this._escapeHtml(stats.db_path || "home-assistant_v2.db")}</div></div>
+            <div class="stat-box"><div class="stat-label">DB size</div><div class="stat-value">${stats.db_size_bytes == null ? "Unavailable" : this._escapeHtml(this._formatBytes(stats.db_size_bytes))}</div></div>
+            <div class="stat-box"><div class="stat-label">Database</div><div class="stat-value">${this._escapeHtml(stats.database || stats.db_path || "home-assistant_v2.db")}</div></div>
           </div>
           ${stats.error ? `<div class="message">Error: ${this._escapeHtml(stats.error)}</div>` : ""}
         </div>
@@ -870,7 +870,7 @@ class GuiRecorderPanel extends HTMLElement {
         ` : `
         <div class="card">
           <h2>Maintenance actions</h2>
-          ${this._data.repack_in_progress ? `<div class="notice pending"><strong>Repack in progress.</strong> The database file is being compacted; this can take a while on large databases. Other purge actions are temporarily disabled.</div>` : ""}
+          ${this._data.repack_in_progress ? `<div class="notice pending"><strong>Repack in progress.</strong> The database is being compacted; this can take a while on large databases. Other purge actions are temporarily disabled.</div>` : ""}
           <div class="settings-grid">
             <div class="setting-box">
               <div class="stat-label">Purge DB</div>
@@ -894,7 +894,7 @@ class GuiRecorderPanel extends HTMLElement {
             <div class="setting-box">
               <div class="stat-label">Repack after manual purge</div>
               <div>${this._switchMarkup({ checked: this._repackAfterManualPurgeValue, kind: "repack-toggle", entityId: "repack_after_manual_purge", disabled: this._togglingRepack })}${this._togglingRepack ? `<span class="pending-dot" title="Saving"></span>` : ""}</div>
-              <div class="row-note" style="margin-top:8px;">When enabled, the database file is compacted (VACUUM) after <em>Purge DB</em> and <em>Purge excluded entities</em>. This reclaims disk space but can take significantly longer, especially on large databases.</div>
+              <div class="row-note" style="margin-top:8px;">When enabled, Home Assistant runs the recorder backend's repack operation after <em>Purge DB</em> and <em>Purge excluded entities</em>. This may reclaim disk space but can take significantly longer, especially on large databases.</div>
             </div>
             <div class="setting-box">
               <div class="stat-label">Restart Home Assistant</div>

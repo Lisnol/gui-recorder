@@ -1,13 +1,13 @@
 # GUI Recorder
 
-[![hacs_badge](https://img.shields.io/badge/HACS-Default-41BDF5.svg)](https://github.com/hacs/default)
-[![GitHub release](https://img.shields.io/github/v/release/martinandersen84/gui-recorder)](https://github.com/martinandersen84/gui-recorder/releases)
+[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz/docs/faq/custom_repositories/)
+[![GitHub release](https://img.shields.io/github/v/release/Lisnol/gui-recorder)](https://github.com/Lisnol/gui-recorder/releases)
 
 A Home Assistant custom component that adds a sidebar panel to manage your `recorder` configuration (which entities get recorded) and database maintenance (purge, repack, stats) — without editing `configuration.yaml`.
 
 ![GUI Recorder overview](images/overview.png)
 
-> **SQLite only.** MariaDB and PostgreSQL are explicitly rejected during setup with a clear error message.
+> **Supported recorder backends:** SQLite and MariaDB/MySQL. PostgreSQL is still rejected during setup.
 
 > [!WARNING]
 > **Use with care.** Purge operations permanently delete recorder history and cannot be undone. The migration flow modifies `configuration.yaml` directly. Always create a full Home Assistant backup before using maintenance or migration features. The authors take no responsibility for data loss.
@@ -16,7 +16,7 @@ A Home Assistant custom component that adds a sidebar panel to manage your `reco
 
 - **Sidebar panel** integrated directly into the Home Assistant navigation bar.
 - **Per-device and per-entity control**: enable or disable recording with a toggle — no YAML editing required.
-- **Database statistics**: total / current / obsolete records, matched exclusions, disk size (sums `.db` + `.db-wal` + `.db-shm`), SQLite file path.
+- **Database statistics**: total / current / obsolete records, matched exclusions, database location and disk/schema size when available.
 - **Maintenance actions**:
   - Purge the database (uses global retention setting).
   - Purge excluded entities (full history, ignores retention).
@@ -39,15 +39,16 @@ A Home Assistant custom component that adds a sidebar panel to manage your `reco
 
 ## Installation
 
-### Via HACS (recommended)
+### Via HACS custom repository (recommended)
 
-GUI Recorder is part of the default HACS catalog — no custom repository needed.
+This MariaDB-enabled fork is installed as a custom HACS repository.
 
-[![Open your Home Assistant instance and open this repository inside HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=martinandersen84&repository=gui-recorder&category=integration)
+[![Open your Home Assistant instance and open this repository inside HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Lisnol&repository=gui-recorder&category=integration)
 
-1. Click the button above, or open **HACS → Integrations** and search for **GUI Recorder**, then install it.
-2. Restart Home Assistant.
-3. Go to **Settings → Devices & services → Add integration** and choose **GUI Recorder**.
+1. Click the button above, or add `https://github.com/Lisnol/gui-recorder` under **HACS → Integrations → Custom repositories** with category **Integration**.
+2. Search for **GUI Recorder** and install it.
+3. Restart Home Assistant.
+4. Go to **Settings → Devices & services → Add integration** and choose **GUI Recorder**.
 
 ### Manual
 
@@ -101,11 +102,19 @@ To leave `configuration.yaml` clean (recommended), fold `gui_recorder.yaml` back
 ## Requirements
 
 - Home Assistant **2024.1.0** or later.
-- Recorder database on **SQLite** (MariaDB and PostgreSQL are not supported).
+- Recorder database on **SQLite** or **MariaDB/MySQL**. PostgreSQL is not supported.
+- MariaDB recorder URLs must be stored in `secrets.yaml` and referenced with `db_url: !secret recorder_db_url` before using the guided migration. The integration stores only the secret name, never the resolved URL or password.
+
+### MariaDB notes
+
+- GUI Recorder reuses Home Assistant's existing SQLAlchemy recorder connection; it does not need separate database credentials or a Python database driver.
+- Entity counts use Home Assistant's current recorder schema and run on the recorder database executor.
+- Schema size is read from `information_schema.TABLES`. If the recorder user cannot read that metadata, size is shown as unavailable while the rest of the analysis continues to work.
+- Purge and repack actions are delegated to Home Assistant's `recorder` services.
 
 ## Support
 
-- Issues: https://github.com/martinandersen84/gui-recorder/issues
+- Issues: https://github.com/Lisnol/gui-recorder/issues
 
 ## License
 

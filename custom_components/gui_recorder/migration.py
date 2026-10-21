@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 import yaml
+from sqlalchemy.engine import make_url
 
 from homeassistant.core import HomeAssistant
 
@@ -24,6 +25,24 @@ class BlockInfo:
     @property
     def text(self) -> str:
         return "\n".join(self.lines) + "\n"
+
+
+@dataclass(frozen=True)
+class SecretReference:
+    """A Home Assistant !secret reference, never the resolved secret value."""
+
+    name: str
+
+
+class _RecorderConfigLoader(yaml.SafeLoader):
+    """Safe YAML loader that preserves Home Assistant secret references."""
+
+
+def _construct_secret(loader: _RecorderConfigLoader, node: yaml.Node) -> SecretReference:
+    return SecretReference(loader.construct_scalar(node).strip())
+
+
+_RecorderConfigLoader.add_constructor("!secret", _construct_secret)
 
 
 def _config_path(hass: HomeAssistant) -> Path:
@@ -109,7 +128,7 @@ def _detect_active_gui_recorder_include(lines: list[str]) -> bool:
 
 def _parse_yaml_text(text: str) -> dict[str, Any] | None:
     try:
-        loaded = yaml.safe_load(text)
+        loaded = yaml.load(text, Loader=_RecorderConfigLoader)
         if isinstance(loaded, dict):
             return loaded
     except Exception:
@@ -117,16 +136,37 @@ def _parse_yaml_text(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _safe_db_url_display(value: Any) -> str | None:
+    """Describe a recorder URL without exposing credentials."""
+    if isinstance(value, SecretReference):
+        return f"!secret {value.name}"
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        url = make_url(value.strip())
+        backend = "MariaDB" if url.drivername.startswith(("mysql", "mariadb")) else url.drivername
+        location = url.database or "database"
+        if url.host:
+            location = f"{location} @ {url.host}"
+        return f"{backend}: {location}"
+    except Exception:  # noqa: BLE001
+        return "configured (credentials hidden)"
+
+
 def _extract_summary_from_recorder_config(recorder_cfg: dict[str, Any] | None) -> dict[str, Any]:
     recorder_cfg = recorder_cfg or {}
     exclude = recorder_cfg.get("exclude") or {}
     include = recorder_cfg.get("include") or {}
+    db_url = recorder_cfg.get("db_url")
+    db_url_secret = db_url.name if isinstance(db_url, SecretReference) else None
+    db_url_literal = db_url.strip() if isinstance(db_url, str) and db_url.strip() else None
+    db_url_is_sqlite = bool(db_url_literal and db_url_literal.lower().startswith("sqlite"))
     return {
         "auto_purge": recorder_cfg.get("auto_purge"),
         "auto_repack": recorder_cfg.get("auto_repack"),
         "purge_keep_days": recorder_cfg.get("purge_keep_days"),
         "commit_interval": recorder_cfg.get("commit_interval"),
-        "db_url": recorder_cfg.get("db_url"),
+        "db_url": _safe_db_url_display(db_url),
         "exclude_entities_count": len(exclude.get("entities") or []),
         "exclude_domains_count": len(exclude.get("domains") or []),
         "exclude_globs_count": len(exclude.get("entity_globs") or []),
@@ -139,7 +179,9 @@ def _extract_summary_from_recorder_config(recorder_cfg: dict[str, Any] | None) -
             "auto_repack": recorder_cfg.get("auto_repack"),
             "purge_keep_days": recorder_cfg.get("purge_keep_days"),
             "commit_interval": recorder_cfg.get("commit_interval"),
-            "db_url": recorder_cfg.get("db_url"),
+            "db_url": db_url_literal if db_url_is_sqlite else None,
+            "db_url_secret": db_url_secret,
+            "db_url_requires_secret": bool(db_url_literal and not db_url_is_sqlite),
             "excluded_entities": list(exclude.get("entities") or []),
         },
         # Filters GUI Recorder doesn't manage per-entity but can still carry over
@@ -319,6 +361,16 @@ def _import_legacy_sync(hass: HomeAssistant) -> dict[str, Any]:
     supported = summary.get("supported_import") or {}
     unsupported_filters = summary.get("unsupported_filters") or {}
 
+    if supported.get("db_url_requires_secret"):
+        return {
+            "ok": False,
+            "error": (
+                "For safety, move the MariaDB db_url to secrets.yaml and use "
+                "'db_url: !secret recorder_db_url' before importing. GUI Recorder "
+                "will preserve the secret reference but never store database credentials."
+            ),
+        }
+
     updates: dict[str, Any] = {
         "excluded_entities": sorted(set(supported.get("excluded_entities") or [])),
         "legacy_imported_at": datetime.now().isoformat(timespec="seconds"),
@@ -335,15 +387,15 @@ def _import_legacy_sync(hass: HomeAssistant) -> dict[str, Any]:
         if value is not None:
             updates[key] = bool(value)
 
-    # Preserve a custom SQLite db_url (e.g. a database moved to /share). The
-    # recorder only reads db_url from its own config, so dropping it on migration
-    # made HA silently start a fresh empty DB at the default path. Only carry over
-    # sqlite URLs - non-sqlite backends can't reach this point anyway (setup aborts
-    # on them), but guard defensively.
+    # Preserve custom SQLite URLs and MariaDB !secret references. A literal
+    # MariaDB URL is rejected above so credentials never enter .storage or the UI.
     db_url = supported.get("db_url")
     if isinstance(db_url, str) and db_url.strip():
         if db_url.strip().lower().startswith("sqlite"):
             updates["db_url"] = db_url.strip()
+    db_url_secret = supported.get("db_url_secret")
+    if isinstance(db_url_secret, str) and db_url_secret.strip():
+        updates["db_url_secret"] = db_url_secret.strip()
 
     # Domain/glob/event_type filters can't be managed per-entity, but unlike
     # entities they can be carried over verbatim as YAML into the manual
@@ -377,7 +429,7 @@ def _import_legacy_sync(hass: HomeAssistant) -> dict[str, Any]:
             "auto_repack": updates.get("auto_repack"),
             "commit_interval": updates.get("commit_interval"),
             "manual_exclusions": bool(manual_block),
-            "db_url": updates.get("db_url"),
+            "db_url": summary.get("db_url") if updates.get("db_url") or updates.get("db_url_secret") else None,
         },
         "unsupported": unsupported,
         "source": status.get("legacy_source_path"),

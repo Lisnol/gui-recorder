@@ -31,8 +31,7 @@ async def _wait_recorder_idle(hass: HomeAssistant) -> None:
 
     The recorder.purge service returns as soon as the task is enqueued, not when
     the actual DELETE has been committed. We wait for the recorder queue to drain,
-    plus a small safety delay so the SQLite WAL checkpoint catches up before any
-    read-only analysis runs.
+    plus a small safety delay before a fresh read-only analysis runs.
     """
     global _BLOCK_API_WARNED
     try:
@@ -51,7 +50,7 @@ async def _wait_recorder_idle(hass: HomeAssistant) -> None:
         if not _BLOCK_API_WARNED:
             _LOGGER.warning("Could not wait for recorder to be idle: %s", err)
             _BLOCK_API_WARNED = True
-    # Small safety margin for SQLite WAL checkpoint visibility on a fresh read-only connection.
+    # Small safety margin for transaction visibility on a fresh read-only session.
     await asyncio.sleep(0.3)
 
 
@@ -167,9 +166,11 @@ def _build_stats_payload(hass: HomeAssistant) -> dict:
     return {
         "entity_counts": entity_counts,
         "generated_at": stats.get("generated_at"),
+        "backend": stats.get("backend"),
+        "database": stats.get("database", stats.get("db_path", "home-assistant_v2.db")),
         "db_path": stats.get("db_path", "home-assistant_v2.db"),
         "total_rows": total_rows,
-        "db_size_bytes": int(stats.get("db_size_bytes", 0) or 0),
+        "db_size_bytes": int(stats["db_size_bytes"]) if stats.get("db_size_bytes") is not None else None,
         "error": stats.get("error"),
     }
 
@@ -611,7 +612,7 @@ async def ws_purge_excluded_entities(hass: HomeAssistant, connection: websocket_
             await _wait_recorder_idle(hass)
         if repack:
             # purge_entities doesn't support repack; run a no-op purge with very high
-            # keep_days just to trigger the VACUUM.
+            # keep_days to trigger the backend-specific repack operation.
             await hass.services.async_call("recorder", "purge", {"keep_days": 36500, "repack": True}, blocking=True)
             await _wait_recorder_idle(hass)
     finally:
