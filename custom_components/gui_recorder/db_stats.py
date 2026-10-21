@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 
 from sqlalchemy import func, select, text
 
@@ -113,6 +114,98 @@ def _mariadb_size_breakdown(session) -> dict[str, int | None]:
         }
 
 
+def _database_health_issues(
+    product: str,
+    version: str,
+    character_set: str | None,
+    default_engine: str | None,
+    non_innodb_tables: int | None,
+) -> list[str]:
+    """Return actionable Recorder database health warnings."""
+    issues: list[str] = []
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", version or "")
+    parsed = tuple(int(part) for part in match.groups()) if match else None
+
+    if product == "MariaDB" and parsed:
+        major, minor, patch = parsed
+        fixed_patches = {5: 17, 6: 9, 7: 5, 8: 4}
+        affected = (major, minor) in {(10, 3), (10, 4)} or (
+            major == 10
+            and minor in fixed_patches
+            and patch < fixed_patches[minor]
+        )
+        if (major, minor) < (10, 3):
+            issues.append("MariaDB is older than Home Assistant's supported minimum 10.3.")
+        elif affected:
+            issues.append(
+                "This MariaDB version is in a range with a known Home Assistant "
+                "history and purge performance regression."
+            )
+    elif product == "MySQL" and parsed and parsed < (8, 0, 0):
+        issues.append("MySQL is older than Home Assistant's supported minimum 8.0.")
+
+    if character_set and character_set.lower() != "utf8mb4":
+        issues.append(
+            f"Database character set is {character_set}; Home Assistant recommends utf8mb4."
+        )
+    if default_engine and default_engine.lower() != "innodb":
+        issues.append(
+            f"Default storage engine is {default_engine}; Recorder requires InnoDB."
+        )
+    if non_innodb_tables:
+        issues.append(
+            f"{non_innodb_tables} Recorder database table(s) are not using InnoDB."
+        )
+    return issues
+
+
+def _mariadb_health(session) -> dict:
+    """Inspect MariaDB/MySQL settings relevant to Home Assistant Recorder."""
+    empty = {
+        "db_product": None,
+        "db_server_version": None,
+        "db_character_set": None,
+        "db_collation": None,
+        "db_default_engine": None,
+        "db_non_innodb_tables": None,
+        "db_health_status": "unavailable",
+        "db_health_issues": [],
+        "db_health_error": None,
+    }
+    try:
+        row = session.execute(
+            text(
+                "SELECT VERSION(), @@character_set_database, "
+                "@@collation_database, @@default_storage_engine, "
+                "(SELECT COUNT(*) FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' "
+                "AND ENGINE <> 'InnoDB')"
+            )
+        ).one()
+        version = str(row[0] or "")
+        product = "MariaDB" if "mariadb" in version.lower() else "MySQL"
+        character_set = str(row[1]) if row[1] is not None else None
+        collation = str(row[2]) if row[2] is not None else None
+        default_engine = str(row[3]) if row[3] is not None else None
+        non_innodb = int(row[4] or 0)
+        issues = _database_health_issues(
+            product, version, character_set, default_engine, non_innodb
+        )
+        return {
+            **empty,
+            "db_product": product,
+            "db_server_version": version,
+            "db_character_set": character_set,
+            "db_collation": collation,
+            "db_default_engine": default_engine,
+            "db_non_innodb_tables": non_innodb,
+            "db_health_status": "warning" if issues else "ok",
+            "db_health_issues": issues,
+        }
+    except Exception as err:  # noqa: BLE001 - health metadata is optional
+        return {**empty, "db_health_error": str(err)}
+
+
 def _analyze_recorder_db(hass: HomeAssistant, backend: str) -> dict:
     """Analyze recorder data on Home Assistant's dedicated database executor."""
     from homeassistant.components.recorder.db_schema import States, StatesMeta
@@ -136,7 +229,10 @@ def _analyze_recorder_db(hass: HomeAssistant, backend: str) -> dict:
             "db_free_bytes": None,
         }
         if backend == "mariadb":
-            size_info = _mariadb_size_breakdown(session)
+            size_info = {
+                **_mariadb_size_breakdown(session),
+                **_mariadb_health(session),
+            }
 
     entity_counts = {entity_id: int(count) for entity_id, count in rows if entity_id}
     if backend == "sqlite":
@@ -243,6 +339,15 @@ async def async_analyze_db(hass: HomeAssistant) -> dict:
             "db_data_bytes": None,
             "db_index_bytes": None,
             "db_free_bytes": None,
+            "db_product": None,
+            "db_server_version": None,
+            "db_character_set": None,
+            "db_collation": None,
+            "db_default_engine": None,
+            "db_non_innodb_tables": None,
+            "db_health_status": None,
+            "db_health_issues": [],
+            "db_health_error": None,
             "total_rows": 0,
             "error": str(err),
         }

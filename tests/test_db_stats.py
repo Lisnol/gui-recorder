@@ -101,5 +101,34 @@ class MariaDbSizeTests(unittest.TestCase):
         )
 
 
+class MariaDbHealthTests(unittest.TestCase):
+    def test_healthy_supported_mariadb(self):
+        result = db_stats._mariadb_health(
+            _Session(("10.11.8-MariaDB", "utf8mb4", "utf8mb4_bin", "InnoDB", 0))
+        )
+
+        self.assertEqual(result["db_product"], "MariaDB")
+        self.assertEqual(result["db_health_status"], "ok")
+        self.assertEqual(result["db_health_issues"], [])
+
+    def test_reports_recorder_relevant_warnings(self):
+        result = db_stats._mariadb_health(
+            _Session(("10.6.8-MariaDB", "latin1", "latin1_swedish_ci", "MyISAM", 2))
+        )
+
+        self.assertEqual(result["db_health_status"], "warning")
+        self.assertEqual(len(result["db_health_issues"]), 4)
+        self.assertTrue(any("performance regression" in issue for issue in result["db_health_issues"]))
+        self.assertTrue(any("utf8mb4" in issue for issue in result["db_health_issues"]))
+
+    def test_health_permission_failure_is_non_fatal(self):
+        result = db_stats._mariadb_health(
+            _Session(error=PermissionError("metadata denied"))
+        )
+
+        self.assertEqual(result["db_health_status"], "unavailable")
+        self.assertIn("metadata denied", result["db_health_error"])
+
+
 if __name__ == "__main__":
     unittest.main()

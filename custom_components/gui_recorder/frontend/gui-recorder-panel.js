@@ -14,6 +14,7 @@ class GuiRecorderPanel extends HTMLElement {
       auto_repack: true,
       commit_interval: 5,
       auto_update_data: true,
+      notify_on_purge_finish: true,
       stats: { entity_counts: {}, generated_at: null, backend: null, database: "home-assistant_v2.db", db_size_bytes: null, total_rows: 0, error: null },
     };
     this._filter = "";
@@ -49,12 +50,17 @@ class GuiRecorderPanel extends HTMLElement {
     this._togglingAutoUpdate = false;
     this._repackAfterManualPurgeValue = false;
     this._togglingRepack = false;
+    this._notifyOnPurgeFinishValue = true;
+    this._togglingNotifications = false;
     this._dataMessage = "";
     this._migration = {};
     this._migrationBusy = false;
     this._manualExclusionsValue = "";
     this._manualExclusionsError = "";
     this._savingManualExclusions = false;
+    this._collapsibleSections = ["maintenance-history", "devices", "orphans", "unmatched", "obsolete"];
+    this._collapsedSections = new Set(["maintenance-history", "orphans", "unmatched", "obsolete"]);
+    this._restoreCollapsedSections();
   }
 
   set hass(hass) {
@@ -101,6 +107,7 @@ class GuiRecorderPanel extends HTMLElement {
       this._commitIntervalValue = Number(result?.commit_interval ?? 5);
       this._autoUpdateDataValue = Boolean(result?.auto_update_data ?? true);
       this._repackAfterManualPurgeValue = Boolean(result?.repack_after_manual_purge ?? false);
+      this._notifyOnPurgeFinishValue = Boolean(result?.notify_on_purge_finish ?? true);
       this._manualExclusionsValue = result?.manual_exclusions_yaml || "";
       this._pruneBulkSelection();
       try {
@@ -110,6 +117,7 @@ class GuiRecorderPanel extends HTMLElement {
         this._purgeProgress = await this._hass.connection.sendMessagePromise({ type: "gui_recorder/get_purge_progress" });
         this._purgeHistory = this._purgeProgress?.history || [];
         if (this._purgeProgress?.active) {
+          this._collapsedSections.delete("maintenance-history");
           this._startPurgeProgressPolling();
         } else if (
           ["completed", "error", "interrupted"].includes(this._purgeProgress?.status)
@@ -117,6 +125,9 @@ class GuiRecorderPanel extends HTMLElement {
           && this._lastHandledPurgeJobId !== this._purgeProgress.job_id
         ) {
           this._lastHandledPurgeJobId = this._purgeProgress.job_id;
+          if (["error", "interrupted"].includes(this._purgeProgress.status)) {
+            this._collapsedSections.delete("maintenance-history");
+          }
           await this._handlePurgeFinished(this._purgeProgress);
         }
       } catch (_err) {}
@@ -141,12 +152,54 @@ class GuiRecorderPanel extends HTMLElement {
     this._commitIntervalValue = Number(result?.commit_interval ?? this._commitIntervalValue ?? 5);
     this._autoUpdateDataValue = Boolean(result?.auto_update_data ?? this._autoUpdateDataValue ?? true);
     this._repackAfterManualPurgeValue = Boolean(result?.repack_after_manual_purge ?? this._repackAfterManualPurgeValue ?? false);
+    this._notifyOnPurgeFinishValue = Boolean(result?.notify_on_purge_finish ?? this._notifyOnPurgeFinishValue ?? true);
     this._manualExclusionsValue = result?.manual_exclusions_yaml ?? this._manualExclusionsValue ?? "";
     this._pruneBulkSelection();
   }
 
   _formatNumber(value) {
     return new Intl.NumberFormat("en-US").format(Number(value || 0));
+  }
+
+  _restoreCollapsedSections() {
+    try {
+      if (typeof localStorage === "undefined") return;
+      const stored = JSON.parse(localStorage.getItem("gui-recorder:collapsed-sections:v1") || "null");
+      if (Array.isArray(stored)) {
+        this._collapsedSections = new Set(stored.filter((section) => this._collapsibleSections.includes(section)));
+      }
+    } catch (_err) { /* Keep safe defaults when browser storage is unavailable. */ }
+  }
+
+  _saveCollapsedSections() {
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem("gui-recorder:collapsed-sections:v1", JSON.stringify([...this._collapsedSections]));
+      }
+    } catch (_err) { /* Collapsing must still work without persistent storage. */ }
+  }
+
+  _toggleSection(section) {
+    if (this._collapsedSections.has(section)) this._collapsedSections.delete(section);
+    else this._collapsedSections.add(section);
+    this._saveCollapsedSections();
+    this._render();
+  }
+
+  _setAllSections(collapsed) {
+    this._collapsedSections = collapsed ? new Set(this._collapsibleSections) : new Set();
+    if (this._purgeProgress?.active) this._collapsedSections.delete("maintenance-history");
+    this._saveCollapsedSections();
+    this._render();
+  }
+
+  _sectionToggleMarkup(section, title, summary) {
+    const collapsed = this._collapsedSections.has(section);
+    return `<button class="section-toggle" data-collapse-section="${this._escapeHtml(section)}" aria-expanded="${collapsed ? "false" : "true"}">
+      <span class="section-caret ${collapsed ? "" : "expanded"}">›</span>
+      <span class="section-title">${this._escapeHtml(title)}</span>
+      ${summary ? `<span class="section-summary">${this._escapeHtml(summary)}</span>` : ""}
+    </button>`;
   }
 
   _formatBytes(value) {
@@ -245,7 +298,10 @@ class GuiRecorderPanel extends HTMLElement {
       const progress = await this._hass.connection.sendMessagePromise({ type: "gui_recorder/get_purge_progress" });
       this._purgeProgress = progress;
       this._purgeHistory = progress?.history || this._purgeHistory;
-      if (progress?.active) this._purgeProgressSeenActive = true;
+      if (progress?.active) {
+        this._purgeProgressSeenActive = true;
+        this._collapsedSections.delete("maintenance-history");
+      }
       const message = this._purgeProgressMessage(progress);
       if (message) this._message = message;
       this._render();
@@ -311,6 +367,8 @@ class GuiRecorderPanel extends HTMLElement {
       }
       if (progress.warning) this._message += ` ${progress.warning}`;
     } else {
+      this._collapsedSections.delete("maintenance-history");
+      this._saveCollapsedSections();
       this._message = `${progress.label || "Purge"} ${progress.status}: ${progress.error || "unknown error"}`;
       this._refreshRecommended = true;
     }
@@ -621,6 +679,26 @@ class GuiRecorderPanel extends HTMLElement {
       this._message = `Error updating repack setting: ${err?.message || err}`;
     } finally {
       this._togglingRepack = false;
+      this._render();
+    }
+  }
+
+  async _setNotifyOnPurgeFinish(value) {
+    const newValue = Boolean(value);
+    const previous = this._notifyOnPurgeFinishValue;
+    this._notifyOnPurgeFinishValue = newValue;
+    this._togglingNotifications = true;
+    this._render();
+    try {
+      await this._hass.connection.sendMessagePromise({
+        type: "gui_recorder/set_notify_on_purge_finish",
+        notify_on_purge_finish: newValue,
+      });
+    } catch (err) {
+      this._notifyOnPurgeFinishValue = previous;
+      this._message = `Error updating notification setting: ${err?.message || err}`;
+    } finally {
+      this._togglingNotifications = false;
       this._render();
     }
   }
@@ -1056,6 +1134,9 @@ class GuiRecorderPanel extends HTMLElement {
       ...filteredObsolete.map((e) => e.entity_id),
     ])].filter((entityId) => Number(purgeEntities.get(entityId)?.record_count || 0) > 0);
     const bulkSummary = this._bulkSelectionSummary();
+    const selectedDeviceEntities = visibleDeviceEntityIds.filter((entityId) => this._bulkSelected.has(entityId)).length;
+    const selectedOrphans = visibleOrphanEntityIds.filter((entityId) => this._bulkSelected.has(entityId)).length;
+    const selectedObsolete = filteredObsolete.filter((entity) => this._bulkSelected.has(entity.entity_id)).length;
     const filteredUnmatchedExclusions = (this._data.unmatched_exclusions || []).filter((e) => !this._filter || String(e).toLowerCase().includes(this._filter.toLowerCase()));
     const stats = this._data.stats || {};
     const totalRows = Number(stats.total_rows || 0);
@@ -1136,6 +1217,14 @@ class GuiRecorderPanel extends HTMLElement {
         .switch.mixed .switch-track::after { transform:translateX(8px); }
         .row-note { color:var(--secondary-text-color); font-size:0.85rem; }
         .orphans-head { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+        .collapsible-head { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+        .section-toggle { flex:1; min-width:220px; display:flex; align-items:center; gap:9px; padding:4px 0; border:none; background:transparent; color:var(--primary-text-color); cursor:pointer; text-align:left; font:inherit; }
+        .section-toggle:focus-visible { outline:2px solid var(--primary-color); outline-offset:4px; border-radius:6px; }
+        .section-caret { display:inline-block; color:var(--secondary-text-color); font-size:22px; line-height:1; transition:transform 0.2s ease; }
+        .section-caret.expanded { transform:rotate(90deg); }
+        .section-title { font-size:1.5em; font-weight:600; }
+        .section-summary { color:var(--secondary-text-color); font-size:0.9rem; font-weight:400; }
+        .section-body { margin-top:12px; }
         .subtle { color:var(--secondary-text-color); }
         .pending-dot { width:8px; height:8px; border-radius:50%; background:var(--warning-color, #ff9800); display:inline-block; margin-left:8px; }
         .action-button.stale { border-color:var(--warning-color, #ff9800); animation:gr-border-pulse 1.4s ease-in-out infinite; }
@@ -1190,7 +1279,7 @@ class GuiRecorderPanel extends HTMLElement {
               <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
                 ${this._narrow ? `<button class="menu-button" id="gr-menu-button" aria-label="Open sidebar"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path fill="currentColor" d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg></button>` : ''}
                 <h1 style="margin:0;">GUI Recorder</h1>
-                <span class="state-pill">v${this._escapeHtml(this._data.version || "0.10.0")}</span>
+                <span class="state-pill">v${this._escapeHtml(this._data.version || "0.10.1")}</span>
               </div>
             </div>
           </div>
@@ -1271,6 +1360,24 @@ class GuiRecorderPanel extends HTMLElement {
           ${stats.error ? `<div class="message">Error: ${this._escapeHtml(stats.error)}</div>` : ""}
         </div>
 
+        ${stats.backend === "mariadb" ? `
+        <div class="card">
+          <div class="orphans-head">
+            <h2>MariaDB Health</h2>
+            <span class="history-status ${stats.db_health_status === "ok" ? "completed" : stats.db_health_status === "warning" ? "interrupted" : ""}">${this._escapeHtml(stats.db_health_status || "unavailable")}</span>
+          </div>
+          <div class="stats-grid">
+            <div class="stat-box"><div class="stat-label">Server</div><div class="stat-value">${this._escapeHtml(stats.db_product || "MariaDB / MySQL")}</div><div class="stat-subtle">${this._escapeHtml(stats.db_server_version || "Version unavailable")}</div></div>
+            <div class="stat-box"><div class="stat-label">Character set</div><div class="stat-value">${this._escapeHtml(stats.db_character_set || "Unavailable")}</div><div class="stat-subtle">${this._escapeHtml(stats.db_collation || "")}</div></div>
+            <div class="stat-box"><div class="stat-label">Default storage engine</div><div class="stat-value">${this._escapeHtml(stats.db_default_engine || "Unavailable")}</div></div>
+            <div class="stat-box"><div class="stat-label">Non-InnoDB tables</div><div class="stat-value">${stats.db_non_innodb_tables == null ? "Unavailable" : this._formatNumber(stats.db_non_innodb_tables)}</div></div>
+          </div>
+          ${(stats.db_health_issues || []).length ? `<div class="notice stale" style="margin-top:12px; margin-bottom:0;"><strong>Attention needed</strong><ul>${stats.db_health_issues.map((issue) => `<li>${this._escapeHtml(issue)}</li>`).join("")}</ul></div>` : ""}
+          ${stats.db_health_status === "ok" ? `<div class="message ok">Recorder database settings checked successfully.</div>` : ""}
+          ${stats.db_health_error ? `<div class="message warn">Health metadata unavailable: ${this._escapeHtml(stats.db_health_error)}</div>` : ""}
+        </div>
+        ` : ""}
+
         ${migrationPending ? `
         <div class="card" style="border-color:var(--warning-color,#ff9800);">
           <div class="message warn" style="margin-top:0;">
@@ -1315,6 +1422,11 @@ class GuiRecorderPanel extends HTMLElement {
               <div class="row-note" style="margin-top:8px;">When enabled, Home Assistant runs the recorder backend's repack operation after <em>Purge DB</em> and <em>Purge excluded entities</em>. This may reclaim disk space but can take significantly longer, especially on large databases.</div>
             </div>
             <div class="setting-box">
+              <div class="stat-label">Maintenance notifications</div>
+              <div>${this._switchMarkup({ checked: this._notifyOnPurgeFinishValue, kind: "notification-toggle", entityId: "notify_on_purge_finish", disabled: this._togglingNotifications })}${this._togglingNotifications ? `<span class="pending-dot" title="Saving"></span>` : ""}</div>
+              <div class="row-note" style="margin-top:8px;">Show a Home Assistant notification when a purge takes at least one minute, fails, or is interrupted. Short successful jobs stay quiet.</div>
+            </div>
+            <div class="setting-box">
               <div class="stat-label">Restart Home Assistant</div>
               <div class="row-note">Restarts Home Assistant so pending recorder configuration changes can take effect. The interface may disconnect briefly during restart.</div>
               <div class="setting-actions" style="margin-top:12px;">
@@ -1326,8 +1438,9 @@ class GuiRecorderPanel extends HTMLElement {
         </div>
 
         <div class="card">
-          <div class="orphans-head"><h2>Maintenance history</h2><div class="subtle">Latest ${this._purgeHistory.length}</div></div>
-          <div class="row-note" style="margin-bottom:10px;">Background purge results are retained for the latest 20 jobs. Interrupted means Home Assistant restarted while monitoring was active.</div>
+          <div class="collapsible-head">${this._sectionToggleMarkup("maintenance-history", "Maintenance history", `Latest ${this._purgeHistory.length}`)}</div>
+          ${this._collapsedSections.has("maintenance-history") ? "" : `<div class="section-body">
+          <div class="row-note" style="margin-bottom:10px;">Background purge results are retained for the latest 20 jobs. Interrupted means Home Assistant restarted while monitoring was active. Active-job checkpoints are saved every 30 seconds.</div>
           ${this._purgeHistory.length === 0 ? `<div>No maintenance jobs recorded yet.</div>` : `
             <table>
               <thead><tr><th>Started</th><th>Job</th><th>Status</th><th class="right">Entities</th><th class="right">Deleted</th><th>Duration</th><th>DB change</th></tr></thead>
@@ -1344,10 +1457,11 @@ class GuiRecorderPanel extends HTMLElement {
               `).join("")}</tbody>
             </table>
           `}
+          </div>`}
         </div>
 
         <div class="card">
-          <h2>Filter</h2>
+          <div class="orphans-head"><h2>Filter</h2><div class="actions-cell"><button class="mini-button" id="expand-all-sections">Expand all sections</button><button class="mini-button" id="collapse-all-sections">Collapse all sections</button></div></div>
           <div class="filter-grid">
             <input id="filter" type="search" placeholder="Filter by entity_id, name, domain, or platform" value="${this._escapeHtml(this._filter)}">
             <select id="quick-filter" aria-label="Quick filter">
@@ -1385,15 +1499,15 @@ class GuiRecorderPanel extends HTMLElement {
         ` : ""}
 
         <div class="card">
-          <div class="orphans-head">
-            <h2>Devices</h2>
+          <div class="collapsible-head">
+            ${this._sectionToggleMarkup("devices", "Devices", `${filteredDevices.length} devices${this._bulkMode ? ` · ${selectedDeviceEntities} selected` : ""}`)}
             <div class="actions-cell">
-              <div class="subtle">${filteredDevices.length}</div>
               ${this._bulkMode ? `<button class="mini-button" data-bulk-section-select="devices">Select section</button><button class="mini-button" data-bulk-section-clear="devices">Clear section</button>` : ""}
               <button class="mini-button" id="devices-select-all" ${!visibleDeviceEntityIds.length || this._pending.has("bulk:devices:select") ? "disabled" : ""}>Record all</button>
               <button class="mini-button" id="devices-deselect-all" ${!visibleDeviceEntityIds.length || this._pending.has("bulk:devices:deselect") ? "disabled" : ""}>Exclude all</button>
             </div>
           </div>
+          ${this._collapsedSections.has("devices") ? "" : `<div class="section-body">
           ${filteredDevices.length === 0 ? `<div>No devices to display.</div>` : devicePage.items.map((device) => {
             const state = this._deviceState(device);
             const expanded = this._expanded.has(device.device_id);
@@ -1455,18 +1569,19 @@ class GuiRecorderPanel extends HTMLElement {
             `;
           }).join("")}
           ${this._paginationMarkup("devices", devicePage.page, devicePage.pageCount, filteredDevices.length)}
+          </div>`}
         </div>
 
         <div class="card">
-          <div class="orphans-head">
-            <h2>Entities without a device</h2>
+          <div class="collapsible-head">
+            ${this._sectionToggleMarkup("orphans", "Entities without a device", `${filteredOrphans.length}${this._bulkMode ? ` · ${selectedOrphans} selected` : ""}`)}
             <div class="actions-cell">
-              <div class="subtle">${filteredOrphans.length}</div>
               ${this._bulkMode ? `<button class="mini-button" data-bulk-section-select="orphans">Select section</button><button class="mini-button" data-bulk-section-clear="orphans">Clear section</button>` : ""}
               <button class="mini-button" id="orphans-select-all" ${!visibleOrphanEntityIds.length || this._pending.has("bulk:orphans:select") ? "disabled" : ""}>Record all</button>
               <button class="mini-button" id="orphans-deselect-all" ${!visibleOrphanEntityIds.length || this._pending.has("bulk:orphans:deselect") ? "disabled" : ""}>Exclude all</button>
             </div>
           </div>
+          ${this._collapsedSections.has("orphans") ? "" : `<div class="section-body">
           ${filteredOrphans.length === 0 ? `<div>No unassigned entities.</div>` : `
             <table>
               <thead>
@@ -1502,16 +1617,17 @@ class GuiRecorderPanel extends HTMLElement {
             </table>
             ${this._paginationMarkup("orphans", orphanPage.page, orphanPage.pageCount, filteredOrphans.length)}
           `}
+          </div>`}
         </div>
 
         <div class="card">
-          <div class="orphans-head">
-            <h2>Unmatched configured exclusions</h2>
+          <div class="collapsible-head">
+            ${this._sectionToggleMarkup("unmatched", "Unmatched configured exclusions", `${filteredUnmatchedExclusions.length}`)}
             <div style="display:flex; align-items:center; gap:8px;">
-              <div class="subtle">${filteredUnmatchedExclusions.length}</div>
               ${filteredUnmatchedExclusions.length ? `<button class="secondary" id="remove-unmatched-exclusions" ${this._pending.has("remove-unmatched") ? "disabled" : ""}>Remove all unmatched</button>` : ""}
             </div>
           </div>
+          ${this._collapsedSections.has("unmatched") ? "" : `<div class="section-body">
           <div class="message">Configured exclusions stored by GUI Recorder that do not match any current entity_id in Home Assistant.</div>
           ${filteredUnmatchedExclusions.length === 0 ? `<div>No unmatched exclusions detected.</div>` : `
             <table>
@@ -1533,10 +1649,12 @@ class GuiRecorderPanel extends HTMLElement {
               </tbody>
             </table>
           `}
+          </div>`}
         </div>
 
         <div class="card">
-          <div class="orphans-head"><h2>Obsolete / unlinked records</h2><div class="actions-cell"><div class="subtle">${filteredObsolete.length}</div>${this._bulkMode ? `<button class="mini-button" data-bulk-section-select="obsolete">Select section</button><button class="mini-button" data-bulk-section-clear="obsolete">Clear section</button>` : ""}</div></div>
+          <div class="collapsible-head">${this._sectionToggleMarkup("obsolete", "Obsolete / unlinked records", `${filteredObsolete.length}${this._bulkMode ? ` · ${selectedObsolete} selected` : ""}`)}<div class="actions-cell">${this._bulkMode ? `<button class="mini-button" data-bulk-section-select="obsolete">Select section</button><button class="mini-button" data-bulk-section-clear="obsolete">Clear section</button>` : ""}</div></div>
+          ${this._collapsedSections.has("obsolete") ? "" : `<div class="section-body">
           <div class="message">Entities present in the database but not in the current Home Assistant entity registry.</div>
           ${filteredObsolete.length === 0 ? `<div>No obsolete / unlinked records detected.</div>` : `
             <table>
@@ -1571,6 +1689,7 @@ class GuiRecorderPanel extends HTMLElement {
             </table>
             ${this._paginationMarkup("obsolete", obsoletePage.page, obsoletePage.pageCount, filteredObsolete.length)}
           `}
+          </div>`}
         </div>
         `}
 
@@ -1623,6 +1742,11 @@ class GuiRecorderPanel extends HTMLElement {
       this._resetPages();
       this._render();
     });
+    this.shadowRoot.querySelectorAll("[data-collapse-section]").forEach((button) => {
+      button.addEventListener("click", () => this._toggleSection(button.getAttribute("data-collapse-section")));
+    });
+    this.shadowRoot.getElementById("expand-all-sections")?.addEventListener("click", () => this._setAllSections(false));
+    this.shadowRoot.getElementById("collapse-all-sections")?.addEventListener("click", () => this._setAllSections(true));
     this.shadowRoot.querySelectorAll("[data-page-section]").forEach((button) => {
       button.addEventListener("click", () => {
         const section = button.getAttribute("data-page-section");
@@ -1740,6 +1864,14 @@ class GuiRecorderPanel extends HTMLElement {
       el.dataset.bound = "1";
       el.addEventListener("change", (ev) => {
         this._setRepackAfterManualPurge(ev.currentTarget.checked);
+      });
+    });
+
+    this.shadowRoot.querySelectorAll("input[data-kind='notification-toggle']").forEach((el) => {
+      if (el.dataset.bound === "1") return;
+      el.dataset.bound = "1";
+      el.addEventListener("change", (ev) => {
+        this._setNotifyOnPurgeFinish(ev.currentTarget.checked);
       });
     });
 

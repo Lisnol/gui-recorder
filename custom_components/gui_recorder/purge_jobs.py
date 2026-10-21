@@ -18,6 +18,8 @@ _PURGE_POLL_INTERVAL = 0.5
 _PURGE_TIMEOUT_SECONDS = 2 * 60 * 60
 _PURGE_STALL_TIMEOUT_SECONDS = 10 * 60
 _PURGE_HISTORY_LIMIT = 20
+_PURGE_CHECKPOINT_INTERVAL_SECONDS = 30
+_NOTIFICATION_MIN_SECONDS = 60
 _BLOCK_API_WARNED = False
 
 
@@ -48,6 +50,8 @@ def _default_progress() -> dict[str, Any]:
         "started_at": None,
         "finished_at": None,
         "updated_at": None,
+        "last_progress_at": None,
+        "checkpointed_at": None,
         "db_size_before": None,
         "db_size_after": None,
         "reclaimed_bytes": None,
@@ -119,17 +123,19 @@ async def _purge_entities_and_wait(
 ) -> dict[str, Any]:
     """Queue one HA purge_entities task and monitor all of its batches."""
     normalized = sorted({entity_id for entity_id in entity_ids if entity_id})
-    set_purge_progress(hass, status="counting", determinate=False)
+    progress = set_purge_progress(hass, status="counting", determinate=False)
+    await _persist_job_checkpoint(hass, progress, force=True)
     initial_rows = await async_count_entity_rows_before(
         hass, normalized, cutoff.timestamp()
     )
-    set_purge_progress(
+    progress = set_purge_progress(
         hass,
         status="purging",
         determinate=True,
         total_rows=initial_rows,
         remaining_rows=initial_rows,
     )
+    await _persist_job_checkpoint(hass, progress, force=True)
     if not normalized or initial_rows == 0:
         return set_purge_progress(hass, status="verifying", remaining_rows=0)
 
@@ -156,9 +162,13 @@ async def _purge_entities_and_wait(
             last_remaining = remaining
             last_progress_at = loop.time()
             updates["last_progress_at"] = _iso_now()
-        set_purge_progress(hass, **updates)
+        progress = set_purge_progress(hass, **updates)
+        await _persist_job_checkpoint(hass, progress)
         if remaining == 0:
-            set_purge_progress(hass, status="verifying", remaining_rows=0)
+            progress = set_purge_progress(
+                hass, status="verifying", remaining_rows=0
+            )
+            await _persist_job_checkpoint(hass, progress, force=True)
             # A synchronization marker can be overtaken by a purge batch that
             # requeued itself behind it. One final barrier covers that batch.
             await _wait_recorder_idle(hass)
@@ -197,6 +207,9 @@ def _history_entry(progress: dict[str, Any]) -> dict[str, Any]:
         "stats_refreshed",
         "started_at",
         "finished_at",
+        "updated_at",
+        "last_progress_at",
+        "checkpointed_at",
         "db_size_before",
         "db_size_after",
         "reclaimed_bytes",
@@ -212,6 +225,32 @@ async def _persist_job_start(hass: HomeAssistant, progress: dict[str, Any]) -> N
     data["active_purge"]["active"] = True
     data["repack_in_progress"] = bool(progress.get("repack"))
     await async_save_data(hass, data)
+    hass.data.setdefault(DOMAIN, {})["purge_checkpoint_monotonic"] = (
+        asyncio.get_running_loop().time()
+    )
+
+
+async def _persist_job_checkpoint(
+    hass: HomeAssistant, progress: dict[str, Any], *, force: bool = False
+) -> None:
+    """Persist bounded active-job progress without writing on every poll."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    now = asyncio.get_running_loop().time()
+    last = float(domain_data.get("purge_checkpoint_monotonic", 0) or 0)
+    if not force and now - last < _PURGE_CHECKPOINT_INTERVAL_SECONDS:
+        return
+
+    data = await async_reload_data(hass)
+    active = data.get("active_purge")
+    if not isinstance(active, dict) or active.get("job_id") != progress.get("job_id"):
+        return
+    checkpoint = _history_entry(progress)
+    checkpoint["active"] = True
+    checkpoint["checkpointed_at"] = _iso_now()
+    data["active_purge"] = checkpoint
+    data["repack_in_progress"] = bool(progress.get("repack"))
+    await async_save_data(hass, data)
+    domain_data["purge_checkpoint_monotonic"] = now
 
 
 async def _persist_job_finish(hass: HomeAssistant, progress: dict[str, Any]) -> None:
@@ -222,6 +261,60 @@ async def _persist_job_finish(hass: HomeAssistant, progress: dict[str, Any]) -> 
     data["active_purge"] = None
     data["repack_in_progress"] = False
     await async_save_data(hass, data)
+    hass.data.setdefault(DOMAIN, {}).pop("purge_checkpoint_monotonic", None)
+
+
+def _job_duration_seconds(progress: dict[str, Any]) -> float:
+    try:
+        start = datetime.fromisoformat(str(progress.get("started_at")))
+        end_value = progress.get("finished_at") or _iso_now()
+        end = datetime.fromisoformat(str(end_value))
+        return max(0.0, (end - start).total_seconds())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _notify_job_result(hass: HomeAssistant, progress: dict[str, Any]) -> None:
+    """Create one replaceable HA notification for long jobs and all failures."""
+    data = hass.data[DOMAIN]["data"]
+    if not bool(data.get("notify_on_purge_finish", True)):
+        return
+    status = str(progress.get("status") or "unknown")
+    duration = _job_duration_seconds(progress)
+    if status == "completed" and duration < _NOTIFICATION_MIN_SECONDS:
+        return
+
+    label = str(progress.get("label") or "Recorder maintenance")
+    if status == "completed":
+        deleted = progress.get("deleted_rows")
+        result = (
+            "Home Assistant finished the purge."
+            if progress.get("determinate") is False
+            else f"Home Assistant deleted {int(deleted or 0):,} records."
+        )
+        title = "GUI Recorder maintenance completed"
+    elif status == "interrupted":
+        result = str(progress.get("error") or "Home Assistant restarted during the job.")
+        title = "GUI Recorder maintenance interrupted"
+    else:
+        result = str(progress.get("error") or "The maintenance job failed.")
+        title = "GUI Recorder maintenance failed"
+
+    minutes, seconds = divmod(int(round(duration)), 60)
+    duration_text = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+    try:
+        await hass.services.async_call(
+            "persistent_notification",
+            "create",
+            {
+                "title": title,
+                "message": f"{label}\n\n{result}\n\nDuration: {duration_text}",
+                "notification_id": "gui_recorder_maintenance",
+            },
+            blocking=False,
+        )
+    except Exception as err:  # noqa: BLE001 - notifications must never fail a purge
+        _LOGGER.warning("Could not create GUI Recorder notification: %s", err)
 
 
 async def async_restore_interrupted_purge(hass: HomeAssistant) -> None:
@@ -251,6 +344,7 @@ async def async_restore_interrupted_purge(hass: HomeAssistant) -> None:
     data["active_purge"] = None
     data["repack_in_progress"] = False
     await async_save_data(hass, data)
+    await _notify_job_result(hass, interrupted)
 
 
 async def _run_purge_job(
@@ -263,7 +357,8 @@ async def _run_purge_job(
     before_size = progress.get("db_size_before")
     try:
         if keep_days is not None:
-            set_purge_progress(hass, status="purging", determinate=False)
+            progress = set_purge_progress(hass, status="purging", determinate=False)
+            await _persist_job_checkpoint(hass, progress, force=True)
             await hass.services.async_call(
                 "recorder",
                 "purge",
@@ -281,7 +376,10 @@ async def _run_purge_job(
                 cutoff=datetime.fromisoformat(progress["started_at"]),
             )
             if progress.get("repack"):
-                set_purge_progress(hass, status="repacking", determinate=False)
+                progress = set_purge_progress(
+                    hass, status="repacking", determinate=False
+                )
+                await _persist_job_checkpoint(hass, progress, force=True)
                 await hass.services.async_call(
                     "recorder",
                     "purge",
@@ -295,7 +393,10 @@ async def _run_purge_job(
         analysis_warning = None
         stats_refreshed = False
         if analyze_after:
-            set_purge_progress(hass, status="analyzing", determinate=False)
+            progress = set_purge_progress(
+                hass, status="analyzing", determinate=False
+            )
+            await _persist_job_checkpoint(hass, progress, force=True)
             stats = await async_analyze_db(hass)
             if stats.get("error"):
                 analysis_warning = (
@@ -324,6 +425,7 @@ async def _run_purge_job(
         completed = {**progress, "active": False, "status": "completed"}
         await _persist_job_finish(hass, completed)
         set_purge_progress(hass, **completed)
+        await _notify_job_result(hass, completed)
     except asyncio.CancelledError:
         # Leave active_purge persisted. The next integration startup records it
         # as interrupted instead of pretending the recorder work was completed.
@@ -349,6 +451,7 @@ async def _run_purge_job(
         failed = {**progress, "active": False}
         await _persist_job_finish(hass, failed)
         set_purge_progress(hass, **failed)
+        await _notify_job_result(hass, failed)
 
 
 async def async_start_purge_job(

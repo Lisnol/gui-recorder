@@ -56,7 +56,20 @@ function fixturePanel() {
     orphans: [{ entity_id: "sensor.orphan", name: "Orphan", platform: "demo", domain: "sensor", record_count: 5, recorded: true }],
     obsolete: [{ entity_id: "sensor.old", name: "Old", platform: "sensor", domain: "sensor", record_count: 7, recorded: false }],
     matched_exclusions: ["sensor.b"],
-    stats: { entity_counts: { "sensor.a": 120000, "sensor.b": 10 }, total_rows: 120022, backend: "mariadb", db_size_bytes: 1000 },
+    stats: {
+      entity_counts: { "sensor.a": 120000, "sensor.b": 10 },
+      total_rows: 120022,
+      backend: "mariadb",
+      db_size_bytes: 1000,
+      db_product: "MariaDB",
+      db_server_version: "10.11.8-MariaDB",
+      db_character_set: "utf8mb4",
+      db_collation: "utf8mb4_bin",
+      db_default_engine: "InnoDB",
+      db_non_innodb_tables: 0,
+      db_health_status: "ok",
+      db_health_issues: [],
+    },
   };
   return panel;
 }
@@ -130,8 +143,19 @@ async function run() {
   assert.match(renderPanel.shadowRoot.innerHTML, /id="quick-filter"/);
   assert.match(renderPanel.shadowRoot.innerHTML, /data-bulk-device="device-1"/);
   assert.match(renderPanel.shadowRoot.innerHTML, /MariaDB indexes/);
+  assert.match(renderPanel.shadowRoot.innerHTML, /MariaDB Health/);
+  assert.match(renderPanel.shadowRoot.innerHTML, /10\.11\.8-MariaDB/);
   assert.match(renderPanel.shadowRoot.innerHTML, /Confirm selected purge/);
   assert.match(renderPanel.shadowRoot.innerHTML, /Refresh statistics afterward/);
+  assert.doesNotMatch(renderPanel.shadowRoot.innerHTML, /sensor\.orphan/);
+
+  renderPanel._collapsedSections.delete("orphans");
+  renderPanel._render();
+  assert.match(renderPanel.shadowRoot.innerHTML, /sensor\.orphan/);
+  renderPanel._setAllSections(true);
+  assert.strictEqual(renderPanel._collapsedSections.has("devices"), true);
+  renderPanel._setAllSections(false);
+  assert.strictEqual(renderPanel._collapsedSections.size, 0);
 
   console.log("frontend tests: ok");
 }

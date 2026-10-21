@@ -148,6 +148,15 @@ def _build_stats_payload(hass: HomeAssistant) -> dict:
         "db_data_bytes": int(stats["db_data_bytes"]) if stats.get("db_data_bytes") is not None else None,
         "db_index_bytes": int(stats["db_index_bytes"]) if stats.get("db_index_bytes") is not None else None,
         "db_free_bytes": int(stats["db_free_bytes"]) if stats.get("db_free_bytes") is not None else None,
+        "db_product": stats.get("db_product"),
+        "db_server_version": stats.get("db_server_version"),
+        "db_character_set": stats.get("db_character_set"),
+        "db_collation": stats.get("db_collation"),
+        "db_default_engine": stats.get("db_default_engine"),
+        "db_non_innodb_tables": stats.get("db_non_innodb_tables"),
+        "db_health_status": stats.get("db_health_status"),
+        "db_health_issues": list(stats.get("db_health_issues") or []),
+        "db_health_error": stats.get("db_health_error"),
         "error": stats.get("error"),
     }
 
@@ -292,6 +301,7 @@ def _build_rows(hass: HomeAssistant) -> dict:
         "commit_interval": int(data.get("commit_interval", 5)),
         "auto_update_data": bool(data.get("auto_update_data", True)),
         "repack_after_manual_purge": bool(data.get("repack_after_manual_purge", False)),
+        "notify_on_purge_finish": bool(data.get("notify_on_purge_finish", True)),
         "repack_in_progress": bool(data.get("repack_in_progress", False)),
         "stats": stats_payload,
         "migration": hass.data[DOMAIN].get("migration", {}),
@@ -530,6 +540,28 @@ async def ws_set_repack_after_manual_purge(hass: HomeAssistant, connection: webs
     data["repack_after_manual_purge"] = bool(msg["repack_after_manual_purge"])
     await async_save_data(hass, data)
     connection.send_result(msg["id"], {"ok": True, "repack_after_manual_purge": data["repack_after_manual_purge"]})
+
+
+@websocket_api.require_admin
+@websocket_api.async_response
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gui_recorder/set_notify_on_purge_finish",
+        vol.Required("notify_on_purge_finish"): bool,
+    }
+)
+async def ws_set_notify_on_purge_finish(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    data = hass.data[DOMAIN]["data"]
+    data["notify_on_purge_finish"] = bool(msg["notify_on_purge_finish"])
+    await async_save_data(hass, data)
+    connection.send_result(
+        msg["id"],
+        {"ok": True, "notify_on_purge_finish": data["notify_on_purge_finish"]},
+    )
 
 
 @websocket_api.require_admin
@@ -812,6 +844,7 @@ async def async_setup_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_set_global_options)
     websocket_api.async_register_command(hass, ws_set_auto_update_data)
     websocket_api.async_register_command(hass, ws_set_repack_after_manual_purge)
+    websocket_api.async_register_command(hass, ws_set_notify_on_purge_finish)
     websocket_api.async_register_command(hass, ws_regenerate_yaml)
     websocket_api.async_register_command(hass, ws_analyze_db)
     websocket_api.async_register_command(hass, ws_get_purge_progress)

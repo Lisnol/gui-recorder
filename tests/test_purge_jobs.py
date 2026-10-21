@@ -235,6 +235,49 @@ class PurgeJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(data["active_purge"])
         self.assertEqual(data["purge_history"][0]["status"], "interrupted")
         self.assertEqual(purge_jobs.purge_progress(self.hass)["status"], "interrupted")
+        self.assertEqual(self.hass.services.calls[-1][0], "persistent_notification")
+
+    async def test_checkpoint_persists_latest_active_progress(self):
+        progress = purge_jobs.set_purge_progress(
+            self.hass,
+            job_id="checkpoint-job",
+            active=True,
+            status="purging",
+            total_rows=100,
+            remaining_rows=40,
+            started_at="2026-10-21T10:00:00+00:00",
+        )
+        self.hass.data["gui_recorder"]["data"]["active_purge"] = {
+            "job_id": "checkpoint-job",
+            "active": True,
+        }
+
+        await purge_jobs._persist_job_checkpoint(self.hass, progress, force=True)
+
+        checkpoint = self.hass.data["gui_recorder"]["data"]["active_purge"]
+        self.assertEqual(checkpoint["remaining_rows"], 40)
+        self.assertEqual(checkpoint["deleted_rows"], 60)
+        self.assertIsNotNone(checkpoint["checkpointed_at"])
+
+    async def test_long_success_notifies_but_short_success_stays_quiet(self):
+        long_job = {
+            "status": "completed",
+            "label": "sensor.a",
+            "determinate": True,
+            "deleted_rows": 10,
+            "started_at": "2026-10-21T10:00:00+00:00",
+            "finished_at": "2026-10-21T10:01:01+00:00",
+        }
+        await purge_jobs._notify_job_result(self.hass, long_job)
+        self.assertEqual(self.hass.services.calls[-1][0], "persistent_notification")
+
+        self.hass.services.calls.clear()
+        short_job = {
+            **long_job,
+            "finished_at": "2026-10-21T10:00:05+00:00",
+        }
+        await purge_jobs._notify_job_result(self.hass, short_job)
+        self.assertEqual(self.hass.services.calls, [])
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ DEFAULT_STORAGE = {
     "commit_interval": 5,
     "auto_update_data": True,
     "repack_after_manual_purge": False,
+    "notify_on_purge_finish": True,
     "repack_in_progress": False,
     "active_purge": None,
     "purge_history": [],
@@ -30,6 +31,15 @@ DEFAULT_STORAGE = {
         "db_data_bytes": None,
         "db_index_bytes": None,
         "db_free_bytes": None,
+        "db_product": None,
+        "db_server_version": None,
+        "db_character_set": None,
+        "db_collation": None,
+        "db_default_engine": None,
+        "db_non_innodb_tables": None,
+        "db_health_status": None,
+        "db_health_issues": [],
+        "db_health_error": None,
         "error": None,
     },
 }
@@ -38,4 +48,4 @@ PANEL_TITLE = "GUI Recorder"
 PANEL_ICON = "mdi:database-cog"
 PANEL_MODULE_URL = "/api/gui_recorder/static/gui-recorder-panel.js"
 
-INTEGRATION_VERSION = "0.10.0"
+INTEGRATION_VERSION = "0.10.1"

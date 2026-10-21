@@ -17,6 +17,7 @@ A Home Assistant custom component that adds a sidebar panel to manage your `reco
 - **Sidebar panel** integrated directly into the Home Assistant navigation bar.
 - **Per-device and per-entity control**: enable or disable recording with a toggle — no YAML editing required.
 - **Database statistics**: total / current / obsolete records, matched exclusions, database location and disk/schema size when available. MariaDB also shows data, index, and free-allocation estimates separately.
+- **MariaDB Health**: reports server version, database character set/collation, default engine, non-InnoDB tables, and known Recorder compatibility warnings without exposing credentials.
 - **Maintenance actions**:
   - Purge the database (uses global retention setting).
   - Purge excluded entities (full history, ignores retention).
@@ -26,7 +27,9 @@ A Home Assistant custom component that adds a sidebar panel to manage your `reco
   - Repack after manual purge (optional).
   - Restart Home Assistant.
 - **Background purge jobs**: jobs continue on the Home Assistant server if the panel is closed or reloaded, with a sticky live progress card showing deleted rows, remaining rows, elapsed time, rate, and last progress.
+- **Resilient checkpoints and notifications**: active progress is saved every 30 seconds; long jobs, failures, and interrupted jobs can create a persistent Home Assistant notification.
 - **Maintenance history**: keeps the latest 20 completed, failed, or interrupted jobs with duration and size change when available.
+- **Collapsible large sections**: maintenance history and entity/device lists can be expanded or collapsed together or individually; the browser remembers the layout.
 - **Large-installation tools**: quick filters, sorting, section-level select/clear, and pagination at 100 rows per page.
 - **Orphan exclusion detection**: shows entries in `gui_recorder.yaml` that no longer match any entity, with a one-click bulk-remove.
 - **Guided migration**: imports your existing `recorder` configuration from `configuration.yaml` in 3 steps (import → disable old block → activate `!include`).
@@ -72,7 +75,7 @@ After installing and configuring the integration, a **GUI Recorder** panel appea
 - Run database analysis and purges (global, per-device, per-entity, or a temporary multi-selection).
 - Import your existing `recorder` config from `configuration.yaml`.
 
-Purge jobs are owned by Home Assistant rather than the browser, so navigating away or reloading the panel does not stop them. Restarting Home Assistant does stop GUI Recorder's in-memory monitor: the job is recorded as **interrupted**, no purge is automatically retried, and you should refresh the database analysis before deciding whether to run it again.
+Purge jobs are owned by Home Assistant rather than the browser, so navigating away or reloading the panel does not stop them. Active progress is checkpointed every 30 seconds. Restarting Home Assistant does stop GUI Recorder's in-memory monitor: the job is recorded as **interrupted** with its last saved checkpoint, no purge is automatically retried, and you should refresh the database analysis before deciding whether to run it again.
 
 The generated configuration is written to `gui_recorder.yaml`, included from `configuration.yaml` via:
 
