@@ -1,16 +1,27 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
+from copy import deepcopy
+import json
+from functools import partial
+import logging
 from pathlib import Path
+from typing import TypeVar
 
 import yaml
 
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
+from .file_utils import atomic_write_utf8
+from .storage import async_update_data
 
 _ALLOWED_EXCLUDE_KEYS = ("domains", "entity_globs", "event_types")
 _ALLOWED_INCLUDE_KEYS = ("domains", "entity_globs")
 _ALLOWED_TOP_KEYS = {"exclude": _ALLOWED_EXCLUDE_KEYS, "include": _ALLOWED_INCLUDE_KEYS}
+_T = TypeVar("_T")
+_LOGGER = logging.getLogger(__name__)
 
 
 def parse_manual_exclusions(text: str) -> dict[str, dict[str, list[str]]]:
@@ -65,7 +76,7 @@ def parse_manual_exclusions(text: str) -> dict[str, dict[str, list[str]]]:
     return result
 
 
-async def async_write_yaml(hass: HomeAssistant) -> str:
+async def _async_write_yaml_locked(hass: HomeAssistant) -> tuple[str, dict]:
     data = hass.data[DOMAIN]["data"]
     generated_path = data.get("generated_path", "gui_recorder.yaml")
     excluded_entities = sorted(set(data.get("excluded_entities", [])))
@@ -75,15 +86,27 @@ async def async_write_yaml(hass: HomeAssistant) -> str:
     auto_repack = bool(data.get("auto_repack", True))
     commit_interval = int(data.get("commit_interval", 5))
     db_url = data.get("db_url")
+    db_url_secret = data.get("db_url_secret")
 
+    # generated_path is an internal compatibility field, not a user-facing
+    # arbitrary path. Refuse a tampered storage value rather than allowing a
+    # configuration action to replace an unrelated file.
+    if generated_path != "gui_recorder.yaml":
+        raise ValueError(
+            "Refusing to write Recorder configuration outside gui_recorder.yaml."
+        )
     path = Path(hass.config.path(generated_path))
 
     try:
         manual = parse_manual_exclusions(data.get("manual_exclusions_yaml", ""))
-    except ValueError:
-        # Already validated when saved; if storage somehow holds something invalid
-        # (e.g. edited externally), skip it rather than write a broken recorder config.
-        manual = {}
+    except ValueError as err:
+        # This is normally validated before it reaches storage. If the storage
+        # file was edited or damaged, failing closed is safer than silently
+        # replacing gui_recorder.yaml without the user's manual filters.
+        raise ValueError(
+            "Stored manual Recorder filters are invalid; refusing to replace "
+            "gui_recorder.yaml."
+        ) from err
 
     # Build ordered dicts (Python 3.7+ preserves insertion order) so safe_dump
     # emits them in our preferred order: entities first under exclude, then the
@@ -127,9 +150,17 @@ async def async_write_yaml(hass: HomeAssistant) -> str:
     parts.append(f"auto_repack: {'true' if auto_repack else 'false'}")
     parts.append(f"purge_keep_days: {purge_keep_days}")
     parts.append(f"commit_interval: {commit_interval}")
-    if isinstance(db_url, str) and db_url.strip():
-        # safe_dump quotes the value if the sqlite URL needs it (it usually
-        # doesn't, but the ':' and '///' are safest left to the emitter).
+    if isinstance(db_url_secret, str) and db_url_secret.strip():
+        # Keep only the secret's name in storage. Home Assistant resolves the
+        # actual MariaDB URL when it loads the generated recorder configuration.
+        parts.append(f"db_url: !secret {json.dumps(db_url_secret.strip())}")
+    elif isinstance(db_url, str) and db_url.strip():
+        # Custom SQLite paths are not credentials and can be stored directly.
+        if not db_url.strip().lower().startswith("sqlite"):
+            raise ValueError(
+                "A non-SQLite db_url must be stored in secrets.yaml and "
+                "referenced by db_url_secret."
+            )
         parts.append(yaml.safe_dump({"db_url": db_url.strip()}, default_flow_style=False).rstrip())
     parts.append("")
 
@@ -143,5 +174,90 @@ async def async_write_yaml(hass: HomeAssistant) -> str:
         parts.append(yaml.safe_dump({"include": include_block}, sort_keys=False, default_flow_style=False).rstrip())
 
     content = "\n".join(parts) + "\n"
-    await hass.async_add_executor_job(path.write_text, content, "utf-8")
-    return str(path)
+    await hass.async_add_executor_job(
+        partial(atomic_write_utf8, path, content, validate_yaml=True)
+    )
+    return str(path), data
+
+
+async def async_write_yaml(hass: HomeAssistant) -> str:
+    """Serialize generated YAML writes so an older snapshot cannot win a race."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    lock = domain_data.get("yaml_write_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        domain_data["yaml_write_lock"] = lock
+    async with lock:
+        while True:
+            path, source_data = await _async_write_yaml_locked(hass)
+            # Storage updates replace the complete in-memory snapshot. If one
+            # happened while the executor was writing, immediately rewrite the
+            # newest snapshot before releasing the lock. This closes the small
+            # cancellation/race window between saving storage and writing YAML.
+            if hass.data[DOMAIN].get("data") is source_data:
+                return path
+
+
+async def async_update_and_write_yaml(
+    hass: HomeAssistant,
+    mutator: Callable[[dict], _T],
+    *,
+    should_write: Callable[[_T], bool] | None = None,
+) -> tuple[dict, _T, str | None]:
+    """Persist a configuration mutation and keep YAML/storage consistent.
+
+    The Store write necessarily happens before the generated YAML write. If
+    the latter fails, restore only the top-level keys changed by this mutation;
+    unrelated statistics or purge checkpoints saved concurrently are retained.
+    """
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    lock = domain_data.get("configuration_update_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        domain_data["configuration_update_lock"] = lock
+
+    async with lock:
+        before_holder: dict[str, dict] = {}
+
+        def _mutate_with_snapshot(current: dict) -> _T:
+            # Capture the rollback baseline while storage's lock is held. A
+            # snapshot taken before acquiring that lock could miss an analysis
+            # or checkpoint update and later roll that unrelated update back.
+            before_holder["data"] = deepcopy(current)
+            return mutator(current)
+
+        data, result = await async_update_data(hass, _mutate_with_snapshot)
+        before = before_holder["data"]
+        if should_write is not None and not should_write(result):
+            return data, result, None
+
+        changed_keys = {
+            key
+            for key in set(before) | set(data)
+            if before.get(key) != data.get(key)
+            or (key in before) != (key in data)
+        }
+        try:
+            path = await async_write_yaml(hass)
+        except Exception:
+            def _rollback(current: dict) -> None:
+                for key in changed_keys:
+                    # Do not overwrite a newer value if an out-of-band update
+                    # happened while the YAML write was in the executor.
+                    if current.get(key) != data.get(key) or (
+                        (key in current) != (key in data)
+                    ):
+                        continue
+                    if key in before:
+                        current[key] = deepcopy(before[key])
+                    else:
+                        current.pop(key, None)
+
+            try:
+                await async_update_data(hass, _rollback)
+            except Exception:  # noqa: BLE001 - keep the original YAML error
+                _LOGGER.exception(
+                    "Could not roll back GUI Recorder storage after a YAML write failure"
+                )
+            raise
+        return data, result, path

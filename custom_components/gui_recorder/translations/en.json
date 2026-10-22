@@ -1,0 +1,15 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "GUI Recorder",
+        "description": "Create the configuration entry to enable the GUI Recorder sidebar panel."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only one GUI Recorder instance is allowed.",
+      "unsupported_database": "GUI Recorder supports SQLite and MariaDB/MySQL recorder backends. Your Home Assistant recorder uses a different database.",
+      "recorder_not_ready": "The Home Assistant recorder is not ready yet. Wait a moment and try again."
+    }
+  }
+}

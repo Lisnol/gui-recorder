@@ -6,6 +6,7 @@ DEFAULT_STORAGE = {
     "rescued_entities": [],
     "manual_exclusions_yaml": "",
     "db_url": None,
+    "db_url_secret": None,
     "generated_path": "gui_recorder.yaml",
     "mode": "exclude_entities",
     "pending_restart": False,
@@ -15,13 +16,31 @@ DEFAULT_STORAGE = {
     "commit_interval": 5,
     "auto_update_data": True,
     "repack_after_manual_purge": False,
+    "notify_on_purge_finish": True,
     "repack_in_progress": False,
+    "active_purge": None,
+    "purge_history": [],
     "legacy_imported_at": None,
     "stats": {
         "entity_counts": {},
         "generated_at": None,
+        "analysis_attempted_at": None,
+        "backend": None,
+        "database": "home-assistant_v2.db",
         "db_path": "home-assistant_v2.db",
-        "db_size_bytes": 0,
+        "db_size_bytes": None,
+        "db_data_bytes": None,
+        "db_index_bytes": None,
+        "db_free_bytes": None,
+        "db_product": None,
+        "db_server_version": None,
+        "db_character_set": None,
+        "db_collation": None,
+        "db_default_engine": None,
+        "db_non_innodb_tables": None,
+        "db_health_status": None,
+        "db_health_issues": [],
+        "db_health_error": None,
         "error": None,
     },
 }
@@ -30,4 +49,4 @@ PANEL_TITLE = "GUI Recorder"
 PANEL_ICON = "mdi:database-cog"
 PANEL_MODULE_URL = "/api/gui_recorder/static/gui-recorder-panel.js"
 
-INTEGRATION_VERSION = "0.8.40"
+INTEGRATION_VERSION = "0.11.0"
