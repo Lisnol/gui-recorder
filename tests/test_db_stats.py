@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
 import sys
@@ -24,10 +25,12 @@ def _load_module():
     const.DOMAIN = "gui_recorder"
     storage = ModuleType("custom_components.gui_recorder.storage")
 
-    async def async_save_data(*_args, **_kwargs):
-        return None
+    async def async_update_data(hass, mutator):
+        data = hass.data["gui_recorder"]["data"]
+        result = mutator(data)
+        return data, result
 
-    storage.async_save_data = async_save_data
+    storage.async_update_data = async_update_data
     sys.modules.update(
         {
             "custom_components": custom_components,
@@ -128,6 +131,82 @@ class MariaDbHealthTests(unittest.TestCase):
 
         self.assertEqual(result["db_health_status"], "unavailable")
         self.assertIn("metadata denied", result["db_health_error"])
+
+
+class AnalysisFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transient_failure_preserves_last_successful_counts(self):
+        previous = {
+            "entity_counts": {"sensor.a": 123},
+            "generated_at": "2026-10-21T10:00:00+00:00",
+            "backend": "mariadb",
+            "database": "homeassistant @ db",
+            "db_size_bytes": 999,
+            "total_rows": 123,
+            "error": None,
+        }
+        hass = type(
+            "Hass",
+            (),
+            {"data": {"gui_recorder": {"data": {"stats": previous}}}},
+        )()
+
+        class Instance:
+            async def async_add_executor_job(self, *_args):
+                await asyncio.sleep(0)
+                raise RuntimeError("temporary database error")
+
+        original_backend = db_stats.get_recorder_backend
+        original_instance = db_stats._get_recorder_instance
+        db_stats.get_recorder_backend = lambda _hass: "mariadb"
+        db_stats._get_recorder_instance = lambda _hass: Instance()
+        try:
+            result = await db_stats.async_analyze_db(hass)
+        finally:
+            db_stats.get_recorder_backend = original_backend
+            db_stats._get_recorder_instance = original_instance
+
+        self.assertEqual(result["entity_counts"], {"sensor.a": 123})
+        self.assertEqual(result["total_rows"], 123)
+        self.assertEqual(result["db_size_bytes"], 999)
+        self.assertEqual(result["generated_at"], "2026-10-21T10:00:00+00:00")
+        self.assertIn("temporary database error", result["error"])
+        self.assertIsNotNone(result["analysis_attempted_at"])
+        self.assertFalse(hass.data["gui_recorder"]["analysis_in_progress"])
+
+    async def test_concurrent_analysis_callers_share_one_scan(self):
+        hass = type(
+            "Hass",
+            (),
+            {"data": {"gui_recorder": {"data": {"stats": {}}}}},
+        )()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def analyze_once(_hass):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            result = {"total_rows": 42, "error": None}
+            _hass.data["gui_recorder"]["data"]["stats"] = result
+            return result
+
+        original = db_stats._async_analyze_db_locked
+        db_stats._async_analyze_db_locked = analyze_once
+        try:
+            first = asyncio.create_task(db_stats.async_analyze_db(hass))
+            await started.wait()
+            second = asyncio.create_task(db_stats.async_analyze_db(hass))
+            await asyncio.sleep(0)
+            release.set()
+            first_result, second_result = await asyncio.gather(first, second)
+        finally:
+            db_stats._async_analyze_db_locked = original
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(first_result["total_rows"], 42)
+        self.assertEqual(second_result["total_rows"], 42)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 from types import ModuleType
 import unittest
+from unittest import mock
 
 
 def _load_module():
@@ -26,8 +27,7 @@ def _load_module():
 
     db_stats.async_analyze_db = placeholder
     db_stats.async_count_entity_rows_before = placeholder
-    storage.async_reload_data = placeholder
-    storage.async_save_data = placeholder
+    storage.async_update_data = placeholder
 
     sys.modules.update(
         {
@@ -51,6 +51,7 @@ def _load_module():
 
 
 purge_jobs = _load_module()
+_real_queue_tracked_recorder_purge = purge_jobs._queue_tracked_recorder_purge
 
 
 class FakeServices:
@@ -83,14 +84,19 @@ class PurgeJobTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.hass = FakeHass()
 
-        async def reload_data(hass):
-            return hass.data["gui_recorder"]["data"]
+        async def update_data(hass, mutator):
+            data = dict(hass.data["gui_recorder"]["data"])
+            result = mutator(data)
+            hass.data["gui_recorder"]["data"] = data
+            return data, result
 
-        async def save_data(hass, data):
-            hass.data["gui_recorder"]["data"] = dict(data)
+        def queue_completed(*_args, **_kwargs):
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(None)
+            return future
 
-        purge_jobs.async_reload_data = reload_data
-        purge_jobs.async_save_data = save_data
+        purge_jobs.async_update_data = update_data
+        purge_jobs._queue_tracked_recorder_purge = queue_completed
 
     async def test_analysis_failure_is_a_completed_job_with_warning(self):
         counts = iter((1, 0))
@@ -155,8 +161,7 @@ class PurgeJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(progress["reclaimed_bytes"], 100)
         self.assertTrue(progress["stats_refreshed"])
         self.assertTrue(progress["determinate"])
-        self.assertEqual(len(self.hass.services.calls), 1)
-        self.assertEqual(self.hass.services.calls[0][1], "purge_entities")
+        self.assertEqual(self.hass.services.calls, [])
         history = self.hass.data["gui_recorder"]["data"]["purge_history"]
         self.assertEqual(history[0]["job_id"], started["job_id"])
 
@@ -210,16 +215,7 @@ class PurgeJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(started["active"])
         self.assertEqual(progress["status"], "completed")
         self.assertFalse(progress["determinate"])
-        self.assertEqual(len(self.hass.services.calls), 1)
-        self.assertEqual(
-            self.hass.services.calls[0],
-            (
-                "recorder",
-                "purge",
-                {"keep_days": 10, "repack": True},
-                True,
-            ),
-        )
+        self.assertEqual(self.hass.services.calls, [])
 
     async def test_restart_marks_persisted_job_interrupted(self):
         self.hass.data["gui_recorder"]["data"]["active_purge"] = {
@@ -278,6 +274,192 @@ class PurgeJobTests(unittest.IsolatedAsyncioTestCase):
         }
         await purge_jobs._notify_job_result(self.hass, short_job)
         self.assertEqual(self.hass.services.calls, [])
+
+    async def test_tracked_recorder_task_requeues_until_private_purge_finishes(self):
+        calls = []
+        outcomes = iter((False, False, True))
+
+        class RecorderTask:
+            pass
+
+        class Instance:
+            def __init__(self):
+                self.queue = []
+
+            def queue_task(self, task):
+                self.queue.append(task)
+
+        instance = Instance()
+        recorder = ModuleType("homeassistant.components.recorder")
+        recorder.get_instance = lambda _hass: instance
+        recorder_purge = ModuleType("homeassistant.components.recorder.purge")
+
+        def purge_entity_data(_instance, entity_filter, cutoff):
+            calls.append((entity_filter("sensor.a"), cutoff))
+            return next(outcomes)
+
+        recorder_purge.purge_entity_data = purge_entity_data
+        tasks = ModuleType("homeassistant.components.recorder.tasks")
+        tasks.RecorderTask = RecorderTask
+        recorder.purge = recorder_purge
+        modules = {
+            "homeassistant.components": ModuleType("homeassistant.components"),
+            "homeassistant.components.recorder": recorder,
+            "homeassistant.components.recorder.purge": recorder_purge,
+            "homeassistant.components.recorder.tasks": tasks,
+        }
+
+        with mock.patch.dict(sys.modules, modules):
+            cutoff = purge_jobs._utcnow()
+            future = _real_queue_tracked_recorder_purge(
+                self.hass,
+                cutoff=cutoff,
+                entity_ids=["sensor.a"],
+                repack=False,
+            )
+            while instance.queue:
+                instance.queue.pop(0).run(instance)
+            await asyncio.sleep(0)
+            await future
+
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(matched for matched, _cutoff in calls))
+
+    async def test_tracked_task_reports_requeue_failure(self):
+        class RecorderTask:
+            pass
+
+        class Instance:
+            def __init__(self):
+                self.queue = []
+                self.queue_calls = 0
+
+            def queue_task(self, task):
+                self.queue_calls += 1
+                if self.queue_calls > 1:
+                    raise RuntimeError("recorder stopped")
+                self.queue.append(task)
+
+        instance = Instance()
+        recorder = ModuleType("homeassistant.components.recorder")
+        recorder.get_instance = lambda _hass: instance
+        recorder_purge = ModuleType("homeassistant.components.recorder.purge")
+        recorder_purge.purge_entity_data = lambda *_args: False
+        tasks = ModuleType("homeassistant.components.recorder.tasks")
+        tasks.RecorderTask = RecorderTask
+        recorder.purge = recorder_purge
+        modules = {
+            "homeassistant.components": ModuleType("homeassistant.components"),
+            "homeassistant.components.recorder": recorder,
+            "homeassistant.components.recorder.purge": recorder_purge,
+            "homeassistant.components.recorder.tasks": tasks,
+        }
+
+        with mock.patch.dict(sys.modules, modules):
+            future = _real_queue_tracked_recorder_purge(
+                self.hass,
+                cutoff=purge_jobs._utcnow(),
+                entity_ids=["sensor.a"],
+                repack=False,
+            )
+            instance.queue.pop().run(instance)
+            await asyncio.sleep(0)
+            with self.assertRaisesRegex(RuntimeError, "recorder stopped"):
+                await future
+
+    async def test_global_tracked_task_finishes_after_recorder_cleanup(self):
+        calls = []
+
+        class RecorderTask:
+            pass
+
+        class Session:
+            def __enter__(self):
+                calls.append("session-enter")
+                return self
+
+            def __exit__(self, *_args):
+                calls.append("session-exit")
+
+        class RunsManager:
+            @staticmethod
+            def load_from_db(_session):
+                calls.append("runs-refreshed")
+
+        class Instance:
+            recorder_runs_manager = RunsManager()
+
+            def __init__(self):
+                self.queue = []
+
+            def queue_task(self, task):
+                self.queue.append(task)
+
+            @staticmethod
+            def get_session():
+                return Session()
+
+        instance = Instance()
+        recorder = ModuleType("homeassistant.components.recorder")
+        recorder.get_instance = lambda _hass: instance
+        recorder_purge = ModuleType("homeassistant.components.recorder.purge")
+        recorder_purge.purge_old_data = lambda *_args: calls.append("purged") or True
+        tasks = ModuleType("homeassistant.components.recorder.tasks")
+        tasks.RecorderTask = RecorderTask
+        util = ModuleType("homeassistant.components.recorder.util")
+        util.periodic_db_cleanups = lambda _instance: calls.append("cleanup")
+        recorder.purge = recorder_purge
+        modules = {
+            "homeassistant.components": ModuleType("homeassistant.components"),
+            "homeassistant.components.recorder": recorder,
+            "homeassistant.components.recorder.purge": recorder_purge,
+            "homeassistant.components.recorder.tasks": tasks,
+            "homeassistant.components.recorder.util": util,
+        }
+
+        with mock.patch.dict(sys.modules, modules):
+            future = _real_queue_tracked_recorder_purge(
+                self.hass,
+                cutoff=purge_jobs._utcnow(),
+                entity_ids=None,
+                repack=True,
+            )
+            instance.queue.pop().run(instance)
+            await asyncio.sleep(0)
+            await future
+
+        self.assertEqual(
+            calls,
+            [
+                "purged",
+                "session-enter",
+                "runs-refreshed",
+                "session-exit",
+                "cleanup",
+            ],
+        )
+
+    async def test_background_task_start_failure_does_not_leave_active_lock(self):
+        def fail_to_start(_coroutine, _name):
+            raise RuntimeError("scheduler unavailable")
+
+        self.hass.async_create_background_task = fail_to_start
+
+        with self.assertRaisesRegex(RuntimeError, "scheduler unavailable"):
+            await purge_jobs.async_start_purge_job(
+                self.hass,
+                kind="entity",
+                label="sensor.a",
+                entity_ids=["sensor.a"],
+            )
+
+        progress = purge_jobs.purge_progress(self.hass)
+        self.assertFalse(progress["active"])
+        self.assertEqual(progress["status"], "error")
+        self.assertEqual(
+            self.hass.data["gui_recorder"]["data"]["purge_history"][0]["status"],
+            "error",
+        )
 
 
 if __name__ == "__main__":

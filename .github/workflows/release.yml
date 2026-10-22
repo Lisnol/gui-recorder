@@ -16,17 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get version
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-
-      - name: Sync manifest version with tag
-        run: |
-          version="${{ steps.version.outputs.version }}"
-          version="${version#v}"
-          jq --arg v "$version" '.version = $v' \
-            custom_components/gui_recorder/manifest.json > manifest.tmp
-          mv manifest.tmp custom_components/gui_recorder/manifest.json
+      - name: Validate release version
+        run: python scripts/check_versions.py "${GITHUB_REF_NAME}"
 
       - name: Create zip
         run: |

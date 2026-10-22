@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
 from uuid import uuid4
@@ -10,17 +10,17 @@ from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
 from .db_stats import async_analyze_db, async_count_entity_rows_before
-from .storage import async_reload_data, async_save_data
+from .storage import async_update_data
 
 _LOGGER = logging.getLogger(__name__)
 
-_PURGE_POLL_INTERVAL = 0.5
-_PURGE_TIMEOUT_SECONDS = 2 * 60 * 60
+# Counting a large target set is itself a non-trivial indexed query. Polling at
+# sub-second cadence can slow the delete batches it is meant to observe.
+_PURGE_POLL_INTERVAL = 2.0
 _PURGE_STALL_TIMEOUT_SECONDS = 10 * 60
 _PURGE_HISTORY_LIMIT = 20
 _PURGE_CHECKPOINT_INTERVAL_SECONDS = 30
 _NOTIFICATION_MIN_SECONDS = 60
-_BLOCK_API_WARNED = False
 
 
 def _utcnow() -> datetime:
@@ -92,27 +92,112 @@ def purge_is_active(hass: HomeAssistant) -> bool:
     )
 
 
-async def _wait_recorder_idle(hass: HomeAssistant) -> None:
-    """Wait for recorder work queued ahead of this synchronization point."""
-    global _BLOCK_API_WARNED
-    try:
-        from homeassistant.components.recorder import get_instance
+def _finish_recorder_future(
+    future: asyncio.Future[None], error: Exception | None = None
+) -> None:
+    """Resolve a recorder completion future safely on HA's event loop."""
+    if future.done():
+        return
+    if error is None:
+        future.set_result(None)
+    else:
+        future.set_exception(error)
 
-        instance = get_instance(hass)
-        block_fn = getattr(instance, "async_block_till_done", None)
-        if block_fn is not None:
-            await block_fn()
-        elif not _BLOCK_API_WARNED:
-            _LOGGER.warning(
-                "Recorder.async_block_till_done() is unavailable; purge analysis "
-                "may briefly show stale data."
-            )
-            _BLOCK_API_WARNED = True
-    except Exception as err:  # noqa: BLE001
-        if not _BLOCK_API_WARNED:
-            _LOGGER.warning("Could not wait for recorder to be idle: %s", err)
-            _BLOCK_API_WARNED = True
-    await asyncio.sleep(0.3)
+
+def _queue_tracked_recorder_purge(
+    hass: HomeAssistant,
+    *,
+    cutoff: datetime,
+    entity_ids: list[str] | None,
+    repack: bool,
+) -> asyncio.Future[None]:
+    """Queue a Recorder task that resolves only after its final batch.
+
+    Home Assistant's public purge services intentionally return after enqueuing
+    their first bounded batch. Its PurgeTask then requeues itself, which means a
+    normal recorder synchronization marker can overtake the next batch. This
+    wrapper uses the same recorder purge functions and owns the requeue loop,
+    giving GUI Recorder an authoritative completion signal including cleanup
+    and repack.
+    """
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder import purge as recorder_purge
+    from homeassistant.components.recorder.tasks import RecorderTask
+
+    instance = get_instance(hass)
+    loop = asyncio.get_running_loop()
+    completed: asyncio.Future[None] = loop.create_future()
+    normalized = frozenset(entity_ids or [])
+
+    class _TrackedPurgeTask(RecorderTask):
+        commit_before = True
+
+        def run(self, recorder_instance) -> None:
+            try:
+                if normalized:
+                    done = recorder_purge.purge_entity_data(
+                        recorder_instance,
+                        normalized.__contains__,
+                        cutoff,
+                    )
+                else:
+                    done = recorder_purge.purge_old_data(
+                        recorder_instance,
+                        cutoff,
+                        repack,
+                        False,
+                    )
+                if not done:
+                    recorder_instance.queue_task(self)
+                    return
+
+                if not normalized:
+                    from homeassistant.components.recorder.util import (
+                        periodic_db_cleanups,
+                    )
+
+                    # Match Home Assistant's PurgeTask finalization. Older HA
+                    # releases refreshed this manager in the task itself;
+                    # current releases do it in purge_old_data. Repeating the
+                    # read is harmless and keeps the whole supported range
+                    # consistent before the periodic WAL/DB cleanup runs.
+                    with recorder_instance.get_session() as session:
+                        recorder_instance.recorder_runs_manager.load_from_db(session)
+                    periodic_db_cleanups(recorder_instance)
+            except Exception as err:  # noqa: BLE001 - propagate to HA loop
+                loop.call_soon_threadsafe(_finish_recorder_future, completed, err)
+                return
+
+            loop.call_soon_threadsafe(_finish_recorder_future, completed)
+
+    instance.queue_task(_TrackedPurgeTask())
+    return completed
+
+
+async def _wait_for_tracked_completion(
+    hass: HomeAssistant,
+    completion: asyncio.Future[None],
+    *,
+    long_status: str,
+) -> None:
+    """Wait indefinitely but make a long-running job visible and persistent."""
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(completion), timeout=_PURGE_STALL_TIMEOUT_SECONDS
+        )
+        return
+    except asyncio.TimeoutError:
+        progress = set_purge_progress(
+            hass,
+            status=long_status,
+            warning=(
+                "Recorder is still processing this operation after "
+                f"{_PURGE_STALL_TIMEOUT_SECONDS // 60} minutes. It remains "
+                "tracked and overlapping maintenance is blocked."
+            ),
+        )
+        await _persist_job_checkpoint(hass, progress, force=True)
+    await completion
 
 
 async def _purge_entities_and_wait(
@@ -139,56 +224,61 @@ async def _purge_entities_and_wait(
     if not normalized or initial_rows == 0:
         return set_purge_progress(hass, status="verifying", remaining_rows=0)
 
-    # Home Assistant requeues bounded PurgeEntitiesTask batches itself. Calling
-    # the service again here would create overlapping jobs, so enqueue only once.
-    await hass.services.async_call(
-        "recorder",
-        "purge_entities",
-        {"entity_id": normalized, "keep_days": 0},
-        blocking=True,
+    completion = _queue_tracked_recorder_purge(
+        hass,
+        cutoff=cutoff,
+        entity_ids=normalized,
+        repack=False,
     )
 
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _PURGE_TIMEOUT_SECONDS
     last_progress_at = loop.time()
     last_remaining = initial_rows
+    warned_stalled = False
     while True:
-        await _wait_recorder_idle(hass)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(completion), timeout=_PURGE_POLL_INTERVAL
+            )
+            return set_purge_progress(
+                hass, status="verifying", remaining_rows=0
+            )
+        except asyncio.TimeoutError:
+            pass
+
         remaining = await async_count_entity_rows_before(
             hass, normalized, cutoff.timestamp()
         )
-        updates: dict[str, Any] = {"status": "purging", "remaining_rows": remaining}
+        updates: dict[str, Any] = {
+            "status": "stalled" if warned_stalled else "purging",
+            "remaining_rows": remaining,
+        }
         if remaining < last_remaining:
             last_remaining = remaining
             last_progress_at = loop.time()
-            updates["last_progress_at"] = _iso_now()
+            warned_stalled = False
+            updates.update(
+                status="purging", last_progress_at=_iso_now(), warning=None
+            )
         progress = set_purge_progress(hass, **updates)
         await _persist_job_checkpoint(hass, progress)
-        if remaining == 0:
+        now = loop.time()
+        if (
+            not warned_stalled
+            and now - last_progress_at >= _PURGE_STALL_TIMEOUT_SECONDS
+        ):
+            warned_stalled = True
             progress = set_purge_progress(
-                hass, status="verifying", remaining_rows=0
+                hass,
+                status="stalled",
+                warning=(
+                    "No row-count progress has been observed for "
+                    f"{_PURGE_STALL_TIMEOUT_SECONDS // 60} minutes. The Recorder "
+                    "task is still tracked and new purges remain blocked until it "
+                    "finishes or Home Assistant restarts."
+                ),
             )
             await _persist_job_checkpoint(hass, progress, force=True)
-            # A synchronization marker can be overtaken by a purge batch that
-            # requeued itself behind it. One final barrier covers that batch.
-            await _wait_recorder_idle(hass)
-            return purge_progress(hass)
-
-        now = loop.time()
-        if now - last_progress_at >= _PURGE_STALL_TIMEOUT_SECONDS:
-            raise TimeoutError(
-                "Purge monitoring stopped because the row count did not decrease "
-                f"for {_PURGE_STALL_TIMEOUT_SECONDS // 60} minutes; {remaining} "
-                "pre-existing rows remain. Home Assistant may still continue its "
-                "queued purge in the background."
-            )
-        if now >= deadline:
-            raise TimeoutError(
-                f"Purge did not finish within {_PURGE_TIMEOUT_SECONDS // 3600} "
-                f"hours; {remaining} pre-existing rows remain. Home Assistant may "
-                "still continue its queued purge in the background."
-            )
-        await asyncio.sleep(_PURGE_POLL_INTERVAL)
 
 
 def _history_entry(progress: dict[str, Any]) -> dict[str, Any]:
@@ -220,11 +310,12 @@ def _history_entry(progress: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _persist_job_start(hass: HomeAssistant, progress: dict[str, Any]) -> None:
-    data = await async_reload_data(hass)
-    data["active_purge"] = _history_entry(progress)
-    data["active_purge"]["active"] = True
-    data["repack_in_progress"] = bool(progress.get("repack"))
-    await async_save_data(hass, data)
+    def _update(data: dict) -> None:
+        data["active_purge"] = _history_entry(progress)
+        data["active_purge"]["active"] = True
+        data["repack_in_progress"] = bool(progress.get("repack"))
+
+    await async_update_data(hass, _update)
     hass.data.setdefault(DOMAIN, {})["purge_checkpoint_monotonic"] = (
         asyncio.get_running_loop().time()
     )
@@ -240,27 +331,34 @@ async def _persist_job_checkpoint(
     if not force and now - last < _PURGE_CHECKPOINT_INTERVAL_SECONDS:
         return
 
-    data = await async_reload_data(hass)
-    active = data.get("active_purge")
-    if not isinstance(active, dict) or active.get("job_id") != progress.get("job_id"):
+    def _update(data: dict) -> bool:
+        active = data.get("active_purge")
+        if not isinstance(active, dict) or active.get("job_id") != progress.get(
+            "job_id"
+        ):
+            return False
+        checkpoint = _history_entry(progress)
+        checkpoint["active"] = True
+        checkpoint["checkpointed_at"] = _iso_now()
+        data["active_purge"] = checkpoint
+        data["repack_in_progress"] = bool(progress.get("repack"))
+        return True
+
+    _data, saved = await async_update_data(hass, _update)
+    if not saved:
         return
-    checkpoint = _history_entry(progress)
-    checkpoint["active"] = True
-    checkpoint["checkpointed_at"] = _iso_now()
-    data["active_purge"] = checkpoint
-    data["repack_in_progress"] = bool(progress.get("repack"))
-    await async_save_data(hass, data)
     domain_data["purge_checkpoint_monotonic"] = now
 
 
 async def _persist_job_finish(hass: HomeAssistant, progress: dict[str, Any]) -> None:
-    data = await async_reload_data(hass)
-    history = list(data.get("purge_history") or [])
-    history.insert(0, _history_entry(progress))
-    data["purge_history"] = history[:_PURGE_HISTORY_LIMIT]
-    data["active_purge"] = None
-    data["repack_in_progress"] = False
-    await async_save_data(hass, data)
+    def _update(data: dict) -> None:
+        history = list(data.get("purge_history") or [])
+        history.insert(0, _history_entry(progress))
+        data["purge_history"] = history[:_PURGE_HISTORY_LIMIT]
+        data["active_purge"] = None
+        data["repack_in_progress"] = False
+
+    await async_update_data(hass, _update)
     hass.data.setdefault(DOMAIN, {}).pop("purge_checkpoint_monotonic", None)
 
 
@@ -332,18 +430,21 @@ async def async_restore_interrupted_purge(hass: HomeAssistant) -> None:
             "finished_at": _iso_now(),
             "error": (
                 "Home Assistant restarted while this job was active. Any recorder "
-                "batch already queued may have completed, but GUI Recorder did not "
-                "assume or restart it. Refresh the analysis before retrying."
+                "batch already executing may have committed, but queued batches do "
+                "not resume after restart. Refresh the analysis before retrying."
             ),
         }
     )
     set_purge_progress(hass, **interrupted)
-    history = list(data.get("purge_history") or [])
-    history.insert(0, _history_entry(interrupted))
-    data["purge_history"] = history[:_PURGE_HISTORY_LIMIT]
-    data["active_purge"] = None
-    data["repack_in_progress"] = False
-    await async_save_data(hass, data)
+
+    def _update(current: dict) -> None:
+        history = list(current.get("purge_history") or [])
+        history.insert(0, _history_entry(interrupted))
+        current["purge_history"] = history[:_PURGE_HISTORY_LIMIT]
+        current["active_purge"] = None
+        current["repack_in_progress"] = False
+
+    await async_update_data(hass, _update)
     await _notify_job_result(hass, interrupted)
 
 
@@ -356,37 +457,49 @@ async def _run_purge_job(
     progress = purge_progress(hass)
     before_size = progress.get("db_size_before")
     try:
-        if keep_days is not None:
-            progress = set_purge_progress(hass, status="purging", determinate=False)
-            await _persist_job_checkpoint(hass, progress, force=True)
-            await hass.services.async_call(
-                "recorder",
-                "purge",
-                {
-                    "keep_days": keep_days,
-                    "repack": bool(progress.get("repack")),
-                },
-                blocking=True,
-            )
-            await _wait_recorder_idle(hass)
-        else:
-            await _purge_entities_and_wait(
-                hass,
-                entity_ids,
-                cutoff=datetime.fromisoformat(progress["started_at"]),
-            )
-            if progress.get("repack"):
+        domain_data = hass.data.setdefault(DOMAIN, {})
+        operation_lock = domain_data.get("db_operation_lock")
+        if operation_lock is None:
+            operation_lock = asyncio.Lock()
+            domain_data["db_operation_lock"] = operation_lock
+
+        # A full count analysis and a purge are both expensive database jobs.
+        # Serialize them so a user cannot accidentally run both at once.
+        async with operation_lock:
+            if keep_days is not None:
                 progress = set_purge_progress(
-                    hass, status="repacking", determinate=False
+                    hass, status="purging", determinate=False
                 )
                 await _persist_job_checkpoint(hass, progress, force=True)
-                await hass.services.async_call(
-                    "recorder",
-                    "purge",
-                    {"keep_days": 36500, "repack": True},
-                    blocking=True,
+                completion = _queue_tracked_recorder_purge(
+                    hass,
+                    cutoff=_utcnow() - timedelta(days=keep_days),
+                    entity_ids=None,
+                    repack=bool(progress.get("repack")),
                 )
-                await _wait_recorder_idle(hass)
+                await _wait_for_tracked_completion(
+                    hass, completion, long_status="purging"
+                )
+            else:
+                await _purge_entities_and_wait(
+                    hass,
+                    entity_ids,
+                    cutoff=datetime.fromisoformat(progress["started_at"]),
+                )
+                if progress.get("repack"):
+                    progress = set_purge_progress(
+                        hass, status="repacking", determinate=False
+                    )
+                    await _persist_job_checkpoint(hass, progress, force=True)
+                    completion = _queue_tracked_recorder_purge(
+                        hass,
+                        cutoff=_utcnow() - timedelta(days=36500),
+                        entity_ids=None,
+                        repack=True,
+                    )
+                    await _wait_for_tracked_completion(
+                        hass, completion, long_status="repacking"
+                    )
 
         analyze_after = bool(progress.get("analyze_after", True))
         after_size = None
@@ -467,7 +580,13 @@ async def async_start_purge_job(
     if purge_is_active(hass):
         raise RuntimeError("Another purge is already in progress")
 
-    normalized = sorted({entity_id.strip() for entity_id in entity_ids or [] if entity_id.strip()})
+    normalized = sorted(
+        {
+            entity_id.strip()
+            for entity_id in entity_ids or []
+            if isinstance(entity_id, str) and entity_id.strip()
+        }
+    )
     data = hass.data[DOMAIN]["data"]
     stats = data.get("stats") or {}
     started_at = _iso_now()
@@ -496,7 +615,17 @@ async def async_start_purge_job(
         warning=None,
         error=None,
     )
-    await _persist_job_start(hass, progress)
+    try:
+        await _persist_job_start(hass, progress)
+    except Exception:
+        set_purge_progress(
+            hass,
+            active=False,
+            status="error",
+            finished_at=_iso_now(),
+            error="The maintenance job could not be saved before it started.",
+        )
+        raise
 
     coroutine = _run_purge_job(
         hass,
@@ -505,15 +634,30 @@ async def async_start_purge_job(
     )
     task_name = f"{DOMAIN} purge {progress['job_id']}"
     config_entry = hass.data[DOMAIN].get("config_entry")
-    if config_entry is not None and hasattr(
-        config_entry, "async_create_background_task"
-    ):
-        task = config_entry.async_create_background_task(
-            hass, coroutine, task_name
+    try:
+        if config_entry is not None and hasattr(
+            config_entry, "async_create_background_task"
+        ):
+            task = config_entry.async_create_background_task(
+                hass, coroutine, task_name
+            )
+        else:
+            # Compatibility fallback for older Home Assistant versions and tests.
+            task = hass.async_create_background_task(coroutine, task_name)
+    except Exception:
+        coroutine.close()
+        failed = set_purge_progress(
+            hass,
+            active=False,
+            status="error",
+            finished_at=_iso_now(),
+            error="The maintenance background task could not be started.",
         )
-    else:
-        # Compatibility fallback for older Home Assistant versions and tests.
-        task = hass.async_create_background_task(coroutine, task_name)
+        try:
+            await _persist_job_finish(hass, failed)
+        except Exception:  # noqa: BLE001 - preserve the original start failure
+            _LOGGER.exception("Could not persist GUI Recorder start failure")
+        raise
     hass.data[DOMAIN]["purge_task"] = task
 
     def _clear_finished(done_task: asyncio.Task) -> None:

@@ -18,11 +18,20 @@ def _read_panel_js() -> str:
 
 async def async_setup_panel(hass: HomeAssistant) -> None:
     panel_js = await hass.async_add_executor_job(_read_panel_js)
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    domain_data["panel_js"] = panel_js
 
     async def _serve_panel_js(_request: web.Request) -> web.Response:
-        return web.Response(text=panel_js, content_type="application/javascript")
+        # The HTTP route lives for the lifetime of Home Assistant, while a
+        # config entry may be reloaded. Read the current source from hass.data
+        # so a reload serves the newly installed panel instead of the closure's
+        # original, stale JavaScript.
+        current_js = hass.data.get(DOMAIN, {}).get("panel_js", "")
+        return web.Response(text=current_js, content_type="application/javascript")
 
-    hass.http.app.router.add_get(PANEL_MODULE_URL, _serve_panel_js)
+    if not domain_data.get("panel_route_registered"):
+        hass.http.app.router.add_get(PANEL_MODULE_URL, _serve_panel_js)
+        domain_data["panel_route_registered"] = True
 
     frontend.async_register_built_in_panel(
         hass,
@@ -38,6 +47,10 @@ async def async_setup_panel(hass: HomeAssistant) -> None:
             }
         },
         require_admin=True,
+        # ``async_panel_exists`` was added after our minimum supported Home
+        # Assistant release. Track our own registration state so reloads can
+        # update the panel without importing a newer-only frontend API.
+        update=bool(domain_data.get("panel_registered")),
     )
 
-    hass.data.setdefault(DOMAIN, {})["panel_registered"] = True
+    domain_data["panel_registered"] = True

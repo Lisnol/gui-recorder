@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -9,7 +10,7 @@ from sqlalchemy import func, select, text
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
-from .storage import async_save_data
+from .storage import async_update_data
 
 SUPPORTED_RECORDER_BACKENDS = {"sqlite", "mariadb"}
 
@@ -219,7 +220,6 @@ def _analyze_recorder_db(hass: HomeAssistant, backend: str) -> dict:
             select(StatesMeta.entity_id, func.count(States.state_id))
             .join(States, States.metadata_id == StatesMeta.metadata_id)
             .group_by(StatesMeta.entity_id)
-            .order_by(func.count(States.state_id).desc())
         ).all()
 
         size_info = {
@@ -247,9 +247,11 @@ def _analyze_recorder_db(hass: HomeAssistant, backend: str) -> dict:
         host = getattr(url, "host", None)
         database = f"{database_name} @ {host}" if host else str(database_name)
 
+    generated_at = datetime.now(timezone.utc).isoformat()
     return {
         "entity_counts": entity_counts,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": generated_at,
+        "analysis_attempted_at": generated_at,
         "backend": backend,
         "database": database,
         # Keep db_path for compatibility with stored data from older versions.
@@ -314,10 +316,10 @@ async def async_count_entity_rows_before(
     )
 
 
-async def async_analyze_db(hass: HomeAssistant) -> dict:
-    data = hass.data[DOMAIN]["data"]
+async def _async_analyze_db_locked(hass: HomeAssistant) -> dict:
     backend = get_recorder_backend(hass)
     database = str(_resolve_sqlite_db_path(hass)) if backend == "sqlite" else "MariaDB"
+    previous = dict(hass.data[DOMAIN]["data"].get("stats") or {})
 
     try:
         if backend not in SUPPORTED_RECORDER_BACKENDS:
@@ -349,9 +351,41 @@ async def async_analyze_db(hass: HomeAssistant) -> dict:
             "db_health_issues": [],
             "db_health_error": None,
             "total_rows": 0,
+            **previous,
+            # Keep the last successful counts and sizes. Replacing them with
+            # zero on a transient DB error makes purge previews misleading and
+            # makes every entity appear to have no history.
+            "backend": backend or previous.get("backend"),
+            "database": previous.get("database") or database,
+            "db_path": previous.get("db_path") or database,
+            "analysis_attempted_at": datetime.now(timezone.utc).isoformat(),
             "error": str(err),
         }
 
-    data["stats"] = stats
-    await async_save_data(hass, data)
+    await async_update_data(hass, lambda data: data.__setitem__("stats", stats))
     return stats
+
+
+async def async_analyze_db(hass: HomeAssistant) -> dict:
+    """Run one expensive analysis and coalesce concurrent callers."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    lock = domain_data.get("analysis_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        domain_data["analysis_lock"] = lock
+    if lock.locked():
+        # A second panel/reconnect should wait for and reuse the result rather
+        # than queue another full GROUP BY scan immediately behind the first.
+        async with lock:
+            return dict(hass.data[DOMAIN]["data"].get("stats") or {})
+
+    operation_lock = domain_data.get("db_operation_lock")
+    if operation_lock is None:
+        operation_lock = asyncio.Lock()
+        domain_data["db_operation_lock"] = operation_lock
+    async with lock, operation_lock:
+        domain_data["analysis_in_progress"] = True
+        try:
+            return await _async_analyze_db_locked(hass)
+        finally:
+            domain_data["analysis_in_progress"] = False

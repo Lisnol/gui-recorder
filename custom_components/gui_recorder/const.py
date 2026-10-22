@@ -24,6 +24,7 @@ DEFAULT_STORAGE = {
     "stats": {
         "entity_counts": {},
         "generated_at": None,
+        "analysis_attempted_at": None,
         "backend": None,
         "database": "home-assistant_v2.db",
         "db_path": "home-assistant_v2.db",
@@ -48,4 +49,4 @@ PANEL_TITLE = "GUI Recorder"
 PANEL_ICON = "mdi:database-cog"
 PANEL_MODULE_URL = "/api/gui_recorder/static/gui-recorder-panel.js"
 
-INTEGRATION_VERSION = "0.10.1"
+INTEGRATION_VERSION = "0.11.0"

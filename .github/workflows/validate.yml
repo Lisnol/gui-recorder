@@ -24,6 +24,8 @@ jobs:
           node-version: "22"
       - name: Compile Python sources
         run: python -m compileall -q custom_components/gui_recorder
+      - name: Check version consistency
+        run: python scripts/check_versions.py
       - name: Run Python tests
         run: python -m unittest discover -s tests -p "test_*.py"
       - name: Check and test panel JavaScript
@@ -32,9 +34,9 @@ jobs:
           node tests/frontend.test.js
       - name: Validate JSON files
         run: |
-          python -m json.tool custom_components/gui_recorder/manifest.json >/dev/null
-          python -m json.tool custom_components/gui_recorder/strings.json >/dev/null
-          python -m json.tool hacs.json >/dev/null
+          for file in custom_components/gui_recorder/manifest.json custom_components/gui_recorder/strings.json custom_components/gui_recorder/translations/*.json hacs.json; do
+            python -m json.tool "$file" >/dev/null
+          done
 
   hacs:
     name: HACS validation

@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import fnmatch
-import re
-
 import voluptuous as vol
 
 from homeassistant.components import websocket_api
@@ -19,8 +16,17 @@ from .purge_jobs import (
     purge_is_active,
     purge_progress,
 )
-from .storage import async_reload_data, async_save_data
-from .yaml_writer import async_write_yaml, parse_manual_exclusions
+from .recorder_filter import (
+    apply_recorded_state,
+    build_manual_filter,
+    build_recorder_filter,
+)
+from .storage import async_patch_data, async_update_data
+from .yaml_writer import (
+    async_update_and_write_yaml,
+    async_write_yaml,
+    parse_manual_exclusions,
+)
 
 
 
@@ -40,94 +46,35 @@ def _normalize_excluded(values) -> list[str]:
     return sorted(normalized)
 
 
-def _manual_exclude_filters(data: dict) -> tuple[set[str], re.Pattern[str] | None]:
-    """Domains and globs from the manual field that hide entities from the recorder.
-
-    The glob pattern is built exactly the way homeassistant.helpers.entityfilter
-    builds it (fnmatch.translate joined with "|", matched with .match), so what we
-    consider hidden is what the recorder actually skips.
-    """
-    try:
-        manual = parse_manual_exclusions(data.get("manual_exclusions_yaml", ""))
-    except ValueError:
-        return set(), None
-
-    exclude = manual.get("exclude", {})
-    domains = set(exclude.get("domains") or [])
-    globs = exclude.get("entity_globs") or []
-    pattern = re.compile("(?:" + "|".join(fnmatch.translate(glob) for glob in set(globs)) + ")") if globs else None
-    return domains, pattern
-
-
-def _is_glob_hidden(entity_id: str, domains: set[str], pattern: re.Pattern[str] | None) -> bool:
-    """True if one of the user's own manual exclude domains/globs matches this entity."""
-    if entity_id.split(".", 1)[0] in domains:
+def _ensure_loaded(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> bool:
+    """Reject retained WebSocket routes after the config entry is unloaded."""
+    if hass.data.get(DOMAIN, {}).get("loaded"):
         return True
-    return bool(pattern and pattern.match(entity_id))
-
-
-def _entity_recorded(entity_id: str, excluded: set[str], rescued: set[str], hidden: bool) -> bool:
-    """Whether the recorder will actually record this entity.
-
-    A hidden entity is only recorded when it is on the rescue list: with exclude
-    domains/globs present, include.entities is the only rule that outranks them
-    (entityfilter case 4b), and it also outranks exclude.entities.
-    """
-    if hidden:
-        return entity_id in rescued
-    return entity_id not in excluded
-
-
-def _apply_toggle(data: dict, entity_ids: set[str], recorded: bool, rescue: bool = False) -> bool:
-    """Move entity_ids to the wanted state across both lists. True if anything changed.
-
-    rescue=True only for the single-entity toggle. Bulk actions (Select all, a whole
-    device) leave entities hidden by the user's own globs alone: rescuing in bulk
-    would silently write one include.entities entry per hidden entity and override
-    the user's globs wholesale. Rescuing stays an explicit, per-entity decision.
-    """
-    excluded = set(_normalize_excluded(data.get("excluded_entities", [])))
-    rescued = set(_normalize_excluded(data.get("rescued_entities", [])))
-    before = (set(excluded), set(rescued))
-    domains, pattern = _manual_exclude_filters(data)
-
-    for entity_id in entity_ids:
-        if recorded:
-            excluded.discard(entity_id)
-            # Removing it from exclude.entities is not enough when one of the user's
-            # own globs hides it - that needs include.entities, which is what the
-            # rescue list becomes.
-            if rescue and _is_glob_hidden(entity_id, domains, pattern):
-                rescued.add(entity_id)
-        else:
-            rescued.discard(entity_id)
-            excluded.add(entity_id)
-
-    if (excluded, rescued) == before:
-        return False
-
-    data["excluded_entities"] = _normalize_excluded(excluded)
-    data["rescued_entities"] = _normalize_excluded(rescued)
-    return True
-
-async def _save_and_reload(hass: HomeAssistant, data: dict) -> dict:
-    await async_save_data(hass, data)
-    await async_write_yaml(hass)
-    reloaded = await async_reload_data(hass)
-    return reloaded
+    connection.send_error(
+        msg["id"],
+        "not_loaded",
+        "GUI Recorder is not loaded",
+    )
+    return False
 
 
 async def _set_entity_recorded_state(hass: HomeAssistant, entity_id: str, recorded: bool) -> tuple[dict, bool]:
-    data = await async_reload_data(hass)
     entity_id = _normalize_entity_id(entity_id)
 
-    changed = _apply_toggle(data, {entity_id}, recorded, rescue=True)
-    if not changed:
-        return data, False
+    def _update(data: dict) -> bool:
+        changed = apply_recorded_state(data, {entity_id}, recorded)
+        if changed:
+            data["pending_restart"] = True
+        return changed
 
-    data["pending_restart"] = True
-    reloaded = await _save_and_reload(hass, data)
-    return reloaded, True
+    data, changed, _generated_file = await async_update_and_write_yaml(
+        hass, _update, should_write=bool
+    )
+    return data, changed
 
 
 def _build_stats_payload(hass: HomeAssistant) -> dict:
@@ -140,6 +87,7 @@ def _build_stats_payload(hass: HomeAssistant) -> dict:
     return {
         "entity_counts": entity_counts,
         "generated_at": stats.get("generated_at"),
+        "analysis_attempted_at": stats.get("analysis_attempted_at"),
         "backend": stats.get("backend"),
         "database": stats.get("database", stats.get("db_path", "home-assistant_v2.db")),
         "db_path": stats.get("db_path", "home-assistant_v2.db"),
@@ -168,11 +116,11 @@ def _build_rows(hass: HomeAssistant) -> dict:
     data = hass.data[DOMAIN]["data"]
     excluded = set(data.get("excluded_entities", []))
     rescued = set(data.get("rescued_entities", []))
-    manual_domains, manual_pattern = _manual_exclude_filters(data)
+    recorder_filter = build_recorder_filter(data)
+    manual_filter = build_manual_filter(data)
 
     def _row_flags(entity_id: str) -> tuple[bool, bool]:
-        hidden = _is_glob_hidden(entity_id, manual_domains, manual_pattern)
-        return _entity_recorded(entity_id, excluded, rescued, hidden), hidden
+        return bool(recorder_filter(entity_id)), not bool(manual_filter(entity_id))
 
     stats_payload = _build_stats_payload(hass)
     entity_counts = stats_payload.get("entity_counts", {})
@@ -303,6 +251,9 @@ def _build_rows(hass: HomeAssistant) -> dict:
         "repack_after_manual_purge": bool(data.get("repack_after_manual_purge", False)),
         "notify_on_purge_finish": bool(data.get("notify_on_purge_finish", True)),
         "repack_in_progress": bool(data.get("repack_in_progress", False)),
+        "analysis_in_progress": bool(
+            hass.data[DOMAIN].get("analysis_in_progress", False)
+        ),
         "stats": stats_payload,
         "migration": hass.data[DOMAIN].get("migration", {}),
         "matched_exclusions": matched_exclusions,
@@ -316,6 +267,8 @@ def _build_rows(hass: HomeAssistant) -> dict:
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/get_tree"})
 @callback
 def ws_get_tree(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     connection.send_result(msg["id"], _build_rows(hass))
 
 
@@ -329,6 +282,8 @@ def ws_get_tree(hass: HomeAssistant, connection: websocket_api.ActiveConnection,
     }
 )
 async def ws_set_entity(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     _, changed = await _set_entity_recorded_state(hass, msg["entity_id"], msg["recorded"])
     connection.send_result(
         msg["id"],
@@ -351,20 +306,24 @@ async def ws_set_entity(hass: HomeAssistant, connection: websocket_api.ActiveCon
     }
 )
 async def ws_set_device(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     entity_registry = er.async_get(hass)
-    data = await async_reload_data(hass)
     device_entity_ids = {
         entry.entity_id
         for entry in entity_registry.entities.values()
         if entry.device_id == msg["device_id"]
     }
 
-    changed = _apply_toggle(data, device_entity_ids, msg["recorded"])
-    generated_file = None
-    if changed:
-        data["pending_restart"] = True
-        await async_save_data(hass, data)
-        generated_file = await async_write_yaml(hass)
+    def _update(data: dict) -> bool:
+        changed = apply_recorded_state(data, device_entity_ids, msg["recorded"])
+        if changed:
+            data["pending_restart"] = True
+        return changed
+
+    _data, changed, generated_file = await async_update_and_write_yaml(
+        hass, _update, should_write=bool
+    )
 
     connection.send_result(msg["id"], {"ok": True, "generated_file": generated_file, "restart_required": changed, "changed": changed})
 
@@ -379,15 +338,19 @@ async def ws_set_device(hass: HomeAssistant, connection: websocket_api.ActiveCon
     }
 )
 async def ws_set_entities_bulk(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
-    data = await async_reload_data(hass)
+    if not _ensure_loaded(hass, connection, msg):
+        return
     entity_ids = {_normalize_entity_id(entity_id) for entity_id in msg["entity_ids"]}
 
-    changed = _apply_toggle(data, entity_ids, msg["recorded"])
-    generated_file = None
-    if changed:
-        data["pending_restart"] = True
-        await async_save_data(hass, data)
-        generated_file = await async_write_yaml(hass)
+    def _update(data: dict) -> bool:
+        changed = apply_recorded_state(data, entity_ids, msg["recorded"])
+        if changed:
+            data["pending_restart"] = True
+        return changed
+
+    _data, changed, generated_file = await async_update_and_write_yaml(
+        hass, _update, should_write=bool
+    )
 
     connection.send_result(
         msg["id"],
@@ -404,6 +367,8 @@ async def ws_set_entities_bulk(hass: HomeAssistant, connection: websocket_api.Ac
     }
 )
 async def ws_set_manual_exclusions(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     yaml_text = msg["yaml_text"]
     try:
         parse_manual_exclusions(yaml_text)
@@ -411,14 +376,16 @@ async def ws_set_manual_exclusions(hass: HomeAssistant, connection: websocket_ap
         connection.send_result(msg["id"], {"ok": False, "error": str(err)})
         return
 
-    data = await async_reload_data(hass)
-    changed = data.get("manual_exclusions_yaml", "") != yaml_text
-    generated_file = None
-    if changed:
-        data["manual_exclusions_yaml"] = yaml_text
-        data["pending_restart"] = True
-        await async_save_data(hass, data)
-        generated_file = await async_write_yaml(hass)
+    def _update(data: dict) -> bool:
+        changed = data.get("manual_exclusions_yaml", "") != yaml_text
+        if changed:
+            data["manual_exclusions_yaml"] = yaml_text
+            data["pending_restart"] = True
+        return changed
+
+    _data, changed, generated_file = await async_update_and_write_yaml(
+        hass, _update, should_write=bool
+    )
 
     connection.send_result(
         msg["id"],
@@ -435,6 +402,8 @@ async def ws_set_manual_exclusions(hass: HomeAssistant, connection: websocket_ap
     }
 )
 async def ws_remove_exclusion(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     _, changed = await _set_entity_recorded_state(hass, msg["entity_id"], True)
     connection.send_result(
         msg["id"],
@@ -450,20 +419,29 @@ async def ws_remove_exclusion(hass: HomeAssistant, connection: websocket_api.Act
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/remove_unmatched_exclusions"})
 async def ws_remove_unmatched_exclusions(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     entity_registry = er.async_get(hass)
     # Same rule as _build_rows: an entity with a live state but no registry entry
     # still exists, so its exclusion is not unmatched and must not be removed here.
     known_entity_ids = {entry.entity_id for entry in entity_registry.entities.values()}
     known_entity_ids |= set(hass.states.async_entity_ids())
-    data = await async_reload_data(hass)
-    excluded = _normalize_excluded(data.get("excluded_entities", []))
+    excluded = _normalize_excluded(
+        hass.data[DOMAIN]["data"].get("excluded_entities", [])
+    )
     removed = sorted(entity_id for entity_id in excluded if entity_id not in known_entity_ids)
 
     if removed:
-        remaining = [eid for eid in excluded if eid not in set(removed)]
-        data["excluded_entities"] = _normalize_excluded(remaining)
-        data["pending_restart"] = True
-        await _save_and_reload(hass, data)
+        removed_set = set(removed)
+
+        def _update(data: dict) -> None:
+            current = _normalize_excluded(data.get("excluded_entities", []))
+            data["excluded_entities"] = [
+                entity_id for entity_id in current if entity_id not in removed_set
+            ]
+            data["pending_restart"] = True
+
+        await async_update_and_write_yaml(hass, _update)
 
     connection.send_result(
         msg["id"],
@@ -486,15 +464,20 @@ async def ws_remove_unmatched_exclusions(hass: HomeAssistant, connection: websoc
     }
 )
 async def ws_set_global_options(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
-    data = await async_reload_data(hass)
-    data["purge_keep_days"] = int(msg["purge_keep_days"])
-    data["auto_purge"] = bool(msg["auto_purge"])
-    data["auto_repack"] = bool(msg["auto_repack"]) if bool(msg["auto_purge"]) else False
-    data["commit_interval"] = int(msg["commit_interval"])
-    data["pending_restart"] = True
-    await async_save_data(hass, data)
-    generated_file = await async_write_yaml(hass)
-    await async_reload_data(hass)
+    if not _ensure_loaded(hass, connection, msg):
+        return
+    def _update(data: dict) -> None:
+        data["purge_keep_days"] = int(msg["purge_keep_days"])
+        data["auto_purge"] = bool(msg["auto_purge"])
+        data["auto_repack"] = (
+            bool(msg["auto_repack"]) if bool(msg["auto_purge"]) else False
+        )
+        data["commit_interval"] = int(msg["commit_interval"])
+        data["pending_restart"] = True
+
+    data, _changed, generated_file = await async_update_and_write_yaml(
+        hass, _update
+    )
 
     connection.send_result(
         msg["id"],
@@ -521,9 +504,11 @@ async def ws_set_global_options(hass: HomeAssistant, connection: websocket_api.A
     }
 )
 async def ws_set_auto_update_data(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
-    data = hass.data[DOMAIN]["data"]
-    data["auto_update_data"] = bool(msg["auto_update_data"])
-    await async_save_data(hass, data)
+    if not _ensure_loaded(hass, connection, msg):
+        return
+    data = await async_patch_data(
+        hass, auto_update_data=bool(msg["auto_update_data"])
+    )
     connection.send_result(msg["id"], {"ok": True, "auto_update_data": data["auto_update_data"]})
 
 
@@ -536,9 +521,12 @@ async def ws_set_auto_update_data(hass: HomeAssistant, connection: websocket_api
     }
 )
 async def ws_set_repack_after_manual_purge(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
-    data = hass.data[DOMAIN]["data"]
-    data["repack_after_manual_purge"] = bool(msg["repack_after_manual_purge"])
-    await async_save_data(hass, data)
+    if not _ensure_loaded(hass, connection, msg):
+        return
+    data = await async_patch_data(
+        hass,
+        repack_after_manual_purge=bool(msg["repack_after_manual_purge"]),
+    )
     connection.send_result(msg["id"], {"ok": True, "repack_after_manual_purge": data["repack_after_manual_purge"]})
 
 
@@ -555,9 +543,11 @@ async def ws_set_notify_on_purge_finish(
     connection: websocket_api.ActiveConnection,
     msg: dict,
 ) -> None:
-    data = hass.data[DOMAIN]["data"]
-    data["notify_on_purge_finish"] = bool(msg["notify_on_purge_finish"])
-    await async_save_data(hass, data)
+    if not _ensure_loaded(hass, connection, msg):
+        return
+    data = await async_patch_data(
+        hass, notify_on_purge_finish=bool(msg["notify_on_purge_finish"])
+    )
     connection.send_result(
         msg["id"],
         {"ok": True, "notify_on_purge_finish": data["notify_on_purge_finish"]},
@@ -568,6 +558,8 @@ async def ws_set_notify_on_purge_finish(
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/regenerate_yaml"})
 async def ws_regenerate_yaml(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     generated_file = await async_write_yaml(hass)
     connection.send_result(msg["id"], {"ok": True, "generated_file": generated_file})
 
@@ -576,6 +568,8 @@ async def ws_regenerate_yaml(hass: HomeAssistant, connection: websocket_api.Acti
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/analyze_db"})
 async def ws_analyze_db(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     if purge_is_active(hass):
         connection.send_error(
             msg["id"],
@@ -593,6 +587,8 @@ async def ws_analyze_db(hass: HomeAssistant, connection: websocket_api.ActiveCon
 def ws_get_purge_progress(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
 ) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     connection.send_result(
         msg["id"],
         {
@@ -606,6 +602,8 @@ def ws_get_purge_progress(
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/purge_all"})
 async def ws_purge_all(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     if purge_is_active(hass):
         connection.send_error(msg["id"], "purge_in_progress", "Another purge is already in progress")
         return
@@ -630,6 +628,8 @@ async def ws_purge_all(hass: HomeAssistant, connection: websocket_api.ActiveConn
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/purge_excluded_entities"})
 async def ws_purge_excluded_entities(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     if purge_is_active(hass):
         connection.send_error(msg["id"], "purge_in_progress", "Another purge is already in progress")
         return
@@ -654,6 +654,8 @@ async def ws_purge_excluded_entities(hass: HomeAssistant, connection: websocket_
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/purge_entity", vol.Required("entity_id"): str})
 async def ws_purge_entity(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     if purge_is_active(hass):
         connection.send_error(msg["id"], "purge_in_progress", "Another purge is already in progress")
         return
@@ -674,6 +676,8 @@ async def ws_purge_entity(hass: HomeAssistant, connection: websocket_api.ActiveC
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/purge_device", vol.Required("device_id"): str})
 async def ws_purge_device(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     if purge_is_active(hass):
         connection.send_error(msg["id"], "purge_in_progress", "Another purge is already in progress")
         return
@@ -714,6 +718,8 @@ async def ws_purge_selected(
     msg: dict,
 ) -> None:
     """Purge a UI-selected set of entities as one tracked recorder job."""
+    if not _ensure_loaded(hass, connection, msg):
+        return
     if purge_is_active(hass):
         connection.send_error(
             msg["id"], "purge_in_progress", "Another purge is already in progress"
@@ -750,13 +756,17 @@ async def ws_purge_selected(
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/restart_homeassistant"})
 async def ws_restart_homeassistant(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
-    if purge_is_active(hass):
-        connection.send_error(
-            msg["id"],
-            "purge_in_progress",
-            "Wait for the active purge to finish before restarting Home Assistant",
-        )
+    if not _ensure_loaded(hass, connection, msg):
         return
+    if purge_is_active(hass):
+        progress = purge_progress(hass)
+        if progress.get("status") != "stalled" and not progress.get("warning"):
+            connection.send_error(
+                msg["id"],
+                "purge_in_progress",
+                "Wait for the active purge to finish or for the no-progress warning before restarting Home Assistant",
+            )
+            return
     await hass.services.async_call("homeassistant", "restart", {}, blocking=False)
     connection.send_result(msg["id"], {"ok": True, "restart_requested": True})
 
@@ -765,6 +775,8 @@ async def ws_restart_homeassistant(hass: HomeAssistant, connection: websocket_ap
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/get_migration_status"})
 async def ws_get_migration_status(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     status = await async_detect_sync_status(hass)
     hass.data[DOMAIN]["migration"] = status
     connection.send_result(msg["id"], status)
@@ -774,11 +786,10 @@ async def ws_get_migration_status(hass: HomeAssistant, connection: websocket_api
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/import_legacy"})
 async def ws_import_legacy(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     result = await async_import_legacy(hass)
     if result.get("ok"):
-        data = hass.data[DOMAIN]["data"]
-        await async_save_data(hass, data)
-        await async_write_yaml(hass)
         hass.data[DOMAIN]["migration"] = await async_detect_sync_status(hass)
     connection.send_result(msg["id"], result)
 
@@ -804,14 +815,14 @@ async def _async_import_pending(hass: HomeAssistant) -> bool:
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/disable_legacy"})
 async def ws_disable_legacy(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     if await _async_import_pending(hass):
         connection.send_result(msg["id"], {"ok": False, "error": _IMPORT_REQUIRED_ERROR})
         return
     result = await async_disable_legacy(hass)
     if result.get("ok"):
-        data = await async_reload_data(hass)
-        data["pending_restart"] = True
-        await async_save_data(hass, data)
+        await async_patch_data(hass, pending_restart=True)
     hass.data[DOMAIN]["migration"] = await async_detect_sync_status(hass)
     connection.send_result(msg["id"], result)
 
@@ -820,15 +831,19 @@ async def ws_disable_legacy(hass: HomeAssistant, connection: websocket_api.Activ
 @websocket_api.async_response
 @websocket_api.websocket_command({vol.Required("type"): "gui_recorder/enable_gui"})
 async def ws_enable_gui(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict) -> None:
+    if not _ensure_loaded(hass, connection, msg):
+        return
     if await _async_import_pending(hass):
         connection.send_result(msg["id"], {"ok": False, "error": _IMPORT_REQUIRED_ERROR})
         return
+    # Generate a complete, validated file before configuration.yaml is changed
+    # to reference it. A write failure therefore cannot leave Recorder pointing
+    # at a missing or stale managed file.
+    generated_file = await async_write_yaml(hass)
     result = await async_ensure_gui_enabled(hass)
     if result.get("ok"):
-        await async_write_yaml(hass)
-        data = await async_reload_data(hass)
-        data["pending_restart"] = True
-        await async_save_data(hass, data)
+        await async_patch_data(hass, pending_restart=True)
+        result["generated_file"] = generated_file
     hass.data[DOMAIN]["migration"] = await async_detect_sync_status(hass)
     connection.send_result(msg["id"], result)
 

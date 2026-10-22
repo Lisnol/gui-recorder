@@ -1,0 +1,15 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "GUI Recorder",
+        "description": "Skapa integrationsposten som aktiverar GUI Recorder i sidofältet."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Endast en instans av GUI Recorder kan läggas till.",
+      "unsupported_database": "GUI Recorder stöder SQLite och MariaDB/MySQL. Home Assistant Recorder använder en annan databas.",
+      "recorder_not_ready": "Home Assistant Recorder är inte redo ännu. Vänta en stund och försök igen."
+    }
+  }
+}

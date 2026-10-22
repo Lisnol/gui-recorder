@@ -20,7 +20,7 @@ A Home Assistant custom component that adds a sidebar panel to manage your `reco
 - **MariaDB Health**: reports server version, database character set/collation, default engine, non-InnoDB tables, and known Recorder compatibility warnings without exposing credentials.
 - **Maintenance actions**:
   - Purge the database (uses global retention setting).
-  - Purge excluded entities (full history, ignores retention).
+  - Purge excluded entities (all state history, ignores retention; Home Assistant keeps long-term statistics separately).
   - Select devices and entities across the filtered views and purge them together as one tracked job.
   - Review a preflight summary with affected entities, analyzed rows, database share, repack, and refresh choices before deletion.
   - Auto-update stats after each purge (optional).
@@ -34,7 +34,9 @@ A Home Assistant custom component that adds a sidebar panel to manage your `reco
 - **Orphan exclusion detection**: shows entries in `gui_recorder.yaml` that no longer match any entity, with a one-click bulk-remove.
 - **Guided migration**: imports your existing `recorder` configuration from `configuration.yaml` in 3 steps (import → disable old block → activate `!include`).
 - **Cache busting**: the panel JS is served with `?v=VERSION` to prevent stale versions after updates.
-- **Tracked entity purges**: device, entity, selected, and excluded-entity purges are queued once, monitored across Home Assistant's internal database batches, and reported complete only after all pre-existing target rows are gone. Monitoring stops after 10 minutes without progress (or two hours total) so a stalled database cannot leave the panel locked forever.
+- **Tracked purges**: global, device, entity, selected, excluded-entity, and repack operations use Home Assistant's Recorder queue and are reported complete only after the final internal database batch. A no-progress warning appears after 10 minutes, while the job remains active so another destructive job cannot overlap it. After that warning, the panel exposes a guarded Home Assistant restart as the escape hatch for a truly stuck Recorder task.
+- **Fail-safe configuration writes**: YAML files are validated and atomically replaced, migration backups cannot collide, and missing integration storage is recovered from an active `gui_recorder.yaml` instead of overwriting it with defaults.
+- **Downloadable diagnostics**: Home Assistant diagnostics include health, settings, and maintenance state while redacting database locations, secret names, entity IDs, job labels, and raw YAML.
 
 ## Screenshots
 
@@ -87,7 +89,7 @@ The integration writes that file automatically. If you already had a `recorder:`
 
 ## Uninstalling
 
-Removing the integration doesn't touch your recorder database or delete any data — GUI Recorder only ever reads it. The generated `gui_recorder.yaml` also lives in your config directory, not inside the integration, so it isn't removed either: `recorder: !include gui_recorder.yaml` is plain Home Assistant YAML and keeps working with the integration gone, so your current recording behavior is preserved either way.
+Removing the integration itself doesn't touch your recorder database or delete any data. Purge buttons do delete the history described in their confirmation dialog while the integration is installed. The generated `gui_recorder.yaml` lives in your config directory, not inside the integration, so it isn't removed either: `recorder: !include gui_recorder.yaml` is plain Home Assistant YAML and keeps working with the integration gone, preserving the current recording behavior.
 
 To leave `configuration.yaml` clean (recommended), fold `gui_recorder.yaml` back into a plain inline `recorder:` block instead of leaving it pointed at a generated file:
 
@@ -109,7 +111,7 @@ To leave `configuration.yaml` clean (recommended), fold `gui_recorder.yaml` back
    ```
 3. Remove the integration: **Settings → Devices & services → GUI Recorder → Delete**. For a manual install, also delete `custom_components/gui_recorder/`.
 4. Restart Home Assistant and confirm everything looks right.
-5. Optional cleanup, only after confirming the restart worked: delete `gui_recorder.yaml` and `.storage/gui_recorder.data`. Neither is required — they're harmless if left in place, and `.storage/gui_recorder.data` lets a future reinstall pick up right where you left off.
+5. Optional cleanup, only after confirming the restart worked: delete `gui_recorder.yaml`. Leave `.storage/gui_recorder.data` in place unless you deliberately want to discard GUI Recorder's saved settings and maintenance history; Home Assistant manages `.storage` files and they should not normally be edited or removed by hand.
 
 ## Requirements
 
@@ -122,7 +124,9 @@ To leave `configuration.yaml` clean (recommended), fold `gui_recorder.yaml` back
 - GUI Recorder reuses Home Assistant's existing SQLAlchemy recorder connection; it does not need separate database credentials or a Python database driver.
 - Entity counts use Home Assistant's current recorder schema and run on the recorder database executor.
 - Schema data size, index size, and `DATA_FREE` are read from `information_schema.TABLES`. `DATA_FREE` is an engine allocation estimate, not a guarantee that repack will return the same number of filesystem bytes. If the recorder user cannot read that metadata, sizes are shown as unavailable while the rest of the analysis continues to work.
-- Purge and repack actions are delegated to Home Assistant's `recorder` services.
+- Purge and repack actions run in Home Assistant's Recorder task queue and use
+  Recorder's own bounded purge implementation; GUI Recorder does not open a
+  second database connection or issue independent delete SQL.
 
 ## Development checks
 

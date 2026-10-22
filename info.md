@@ -12,6 +12,7 @@ A Home Assistant sidebar panel to manage your `recorder` configuration and datab
 - Optional analysis refresh and repack after purge, plus Home Assistant restart.
 - Detects orphan exclusions (entries that no longer match any entity) and removes them in bulk.
 - Guided migration from a legacy `recorder:` block in `configuration.yaml`.
+- Safe atomic YAML writes, managed-file recovery, and redacted Home Assistant diagnostics.
 
 ## Requirements
 
